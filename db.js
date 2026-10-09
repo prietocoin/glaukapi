@@ -1,21 +1,25 @@
-import pg from 'pg';
-import { env } from './env.js';
+/**
+ * @file db.js
+ * Conector de PostgreSQL con soporte dual para DATABASE_URL o credenciales individuales.
+ */
+const { Pool } = require('pg');
 
-const { Pool } = pg;
+const config = process.env.DATABASE_URL
+  ? { connectionString: process.env.DATABASE_URL }
+  : {
+      host: process.env.DB_HOST || 'automat_postgres-db',
+      port: Number(process.env.DB_PORT) || 5432,
+      user: process.env.DB_USER || 'postgres',
+      password: process.env.DB_PASSWORD,
+      database: process.env.DB_NAME || 'automat'
+    };
 
-const pool = new Pool({
-  host: env.DB_HOST,
-  port: env.DB_PORT,
-  user: env.DB_USER,
-  password: env.DB_PASSWORD,
-  database: env.DB_NAME,
-  max: 10,
-  idleTimeoutMillis: 30000,
-  connectionTimeoutMillis: 2000,
-});
+if (process.env.NODE_ENV === 'production') {
+  config.ssl = { rejectUnauthorized: false };
+}
 
-pool.on('error', (err) => {
-  console.error('❌ [PostgreSQL Error - TasasHub]:', err.message);
-});
+const pool = new Pool(config);
 
-export default pool;
+module.exports = {
+  query: (text, params) => pool.query(text, params)
+};
