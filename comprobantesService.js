@@ -1,6 +1,7 @@
 /**
  * @file comprobantesService.js
- * Servicio determinista glaukapi con sanitización estricta de nombres y resolución limpia de tasas.
+ * Servicio determinista de procesamiento de comprobantes para glaukapi.
+ * Soporta herencia estricta a FUNDDA, lectura de polar_D/polar_P y lote por timestamp_msg.
  */
 
 const db = require('./db');
@@ -12,7 +13,7 @@ if (!rawHubUrl.includes('/api/v1/tasas/calcular')) {
 const TASASHUB_BASE_URL = rawHubUrl;
 
 /**
- * Normalización de alias de moneda
+ * Normaliza alias de monedas locales a códigos estándar.
  */
 function normalizarCodigoMoneda(moneda) {
   const mon = String(moneda || '').trim().toUpperCase();
@@ -20,22 +21,25 @@ function normalizarCodigoMoneda(moneda) {
   if (mon === 'PEN' || mon === 'SOL' || mon === 'SOLES') return ['PEN', 'SOL', 'SOLES'];
   if (mon === 'ARS' || mon === 'ARG') return ['ARS', 'ARG'];
   if (mon === 'COP') return ['COP'];
-  if (mon === 'USD' || mon === 'USDT') return ['USD', 'USDT', 'ECU'];
+  if (mon === 'USD' || mon === 'USDT' || mon === 'ECU') return ['USD', 'USDT', 'ECU'];
   return [mon];
 }
 
 /**
- * Sanitizador estricto de nombres para URLs de TasasHub
+ * Sanitiza nombres comerciales para peticiones HTTP a TasasHub.
  */
 function limpiarNombreGrupo(nombre) {
   if (!nombre) return '';
   return String(nombre)
     .trim()
-    .replace(/^FUNDDA\./i, '') // Si viene con prefijo interno FUNDDA.
-    .replace(/[^a-zA-Z0-9_\-]/g, '') // Elimina caracteres extraños
+    .replace(/^FUNDDA\./i, '')
+    .replace(/[^a-zA-Z0-9_\-]/g, '')
     .toUpperCase();
 }
 
+/**
+ * Parsea el timestamp_msg de RemitHub a objeto Date de JavaScript.
+ */
 function parsearTimestampMsg(ts) {
   if (!ts) return new Date();
   if (typeof ts === 'string' && ts.includes('T')) {
@@ -49,14 +53,15 @@ function parsearTimestampMsg(ts) {
 }
 
 /**
- * Consulta el perfil matriz de FUNDDA
+ * Obtiene el perfil matriz de FUNDDA desde PostgreSQL.
  */
 async function obtenerPerfilMatrizFundda() {
   try {
     const { rows } = await db.query(`
       SELECT id_grupo, nombre, moneda_base, monedas, herencia 
       FROM perfiles_glaukov 
-      WHERE UPPER(TRIM(nombre)) = 'FUNDDA' OR id_grupo = '120363401374720092@g.us'
+      WHERE UPPER(TRIM(nombre)) = 'FUNDDA' 
+         OR UPPER(TRIM(id_grupo)) = '120363401374720092@G.US'
       LIMIT 1;
     `);
     if (!rows[0]) return null;
@@ -73,7 +78,7 @@ async function obtenerPerfilMatrizFundda() {
 }
 
 /**
- * Obtener perfil del grupo en Postgres con regla de Herencia
+ * Obtiene el perfil del grupo en Postgres y resuelve la herencia si herencia === true.
  */
 async function obtenerPerfilGrupo(identificador) {
   if (!identificador || identificador === 'GENERAL' || identificador === 'NO DEFINIDO') {
@@ -101,12 +106,13 @@ async function obtenerPerfilGrupo(identificador) {
       try { perfil.monedas = JSON.parse(perfil.monedas); } catch (e) { perfil.monedas = {}; }
     }
 
-    // Si herencia === true -> Usa FUNDDA para consultar TasasHub y hereda sus monedas
+    // 🟢 REGLA DE HERENCIA BOOLEANA LIMPIA
     if (perfil.herencia === true) {
       const matrizFundda = await obtenerPerfilMatrizFundda();
       perfil.grupo_tasashub = 'FUNDDA';
+
       if (matrizFundda && matrizFundda.monedas) {
-        perfil.monedas = matrizFundda.monedas;
+        perfil.monedas = { ...matrizFundda.monedas, ...(perfil.monedas || {}) };
       }
       if (!perfil.moneda_base && matrizFundda?.moneda_base) {
         perfil.moneda_base = matrizFundda.moneda_base;
@@ -122,6 +128,9 @@ async function obtenerPerfilGrupo(identificador) {
   }
 }
 
+/**
+ * Verifica si un socio tiene configurada y activa la moneda en su pool.
+ */
 function socioTieneMonedaConfigurada(perfil, moneda) {
   if (!perfil || !perfil.monedas) return false;
   const codigos = normalizarCodigoMoneda(moneda);
@@ -132,6 +141,9 @@ function socioTieneMonedaConfigurada(perfil, moneda) {
   return config && config.activo !== false;
 }
 
+/**
+ * Determina la polaridad exacta (+ / -) leyendo polar_D o polar_P.
+ */
 function obtenerPolaridadPorTipo(perfil, moneda, tipoCalculado, esSocio1 = true) {
   if (tipoCalculado === 'A') return esSocio1 ? '+' : '-';
   if (!perfil || !perfil.monedas) return '+';
@@ -152,6 +164,9 @@ function obtenerPolaridadPorTipo(perfil, moneda, tipoCalculado, esSocio1 = true)
   return '+';
 }
 
+/**
+ * Busca en tasas_glaukov el lote publicado con created_at <= timestamp_msg.
+ */
 async function obtenerLoteTasasPorFecha(timestampMsg) {
   try {
     const fechaRemitHub = parsearTimestampMsg(timestampMsg);
@@ -184,7 +199,7 @@ async function obtenerLoteTasasPorFecha(timestampMsg) {
 }
 
 /**
- * Consulta a TasasHub limpia y sanitizada
+ * Realiza la consulta HTTP a TasasHub.
  */
 async function consultarTasasHub(nombreGrupo, idLote) {
   const grupoLimpio = limpiarNombreGrupo(nombreGrupo);
@@ -196,10 +211,7 @@ async function consultarTasasHub(nombreGrupo, idLote) {
     const url = `${TASASHUB_BASE_URL}/${grupoQuery}${loteQuery}`;
 
     const res = await fetch(url);
-    if (!res.ok) {
-      console.warn(`[glaukapi ⚠️ TasasHub HTTP ${res.status}] URL: ${url}`);
-      return null;
-    }
+    if (!res.ok) return null;
     
     const json = await res.json();
     return json?.data || json;
@@ -209,6 +221,9 @@ async function consultarTasasHub(nombreGrupo, idLote) {
   }
 }
 
+/**
+ * Extrae el valor numérico de la tasa según la naturaleza (compra para D, venta para P).
+ */
 function extraerTasaHub(dataHub, moneda, naturaleza) {
   if (!dataHub || !Array.isArray(dataHub.tarjetas_paises)) return 'N/A';
 
@@ -237,6 +252,9 @@ function extraerTasaHub(dataHub, moneda, naturaleza) {
   return !isNaN(compra) && compra > 0 ? compra : (!isNaN(venta) && venta > 0 ? venta : 'N/A');
 }
 
+/**
+ * Función principal exportada para procesar un comprobante.
+ */
 async function procesarComprobante(item) {
   const monto = Math.abs(Number(item.monto || item.monto_local || 0));
   const moneda = String(item.moneda || item.moneda_local || '').trim().toUpperCase();
@@ -262,7 +280,7 @@ async function procesarComprobante(item) {
   const tieneMonedaS1 = socioTieneMonedaConfigurada(perfil1, moneda);
   const tieneMonedaS2 = socioTieneMonedaConfigurada(perfil2, moneda);
 
-  // Nombre limpio para TasasHub (si hereda true usa "FUNDDA", de lo contrario su propio nombre)
+  // Nombre objetivo para consultar en TasasHub (si herencia === true usa "FUNDDA")
   const targetTasas1 = perfil1?.grupo_tasashub || nombreGrupo1;
   const targetTasas2 = perfil2?.grupo_tasashub || nombreGrupo2;
 
@@ -274,7 +292,7 @@ async function procesarComprobante(item) {
   const monBase1 = String(perfil1?.moneda_base || 'USDT').trim().toUpperCase();
   const monBase2 = String(perfil2?.moneda_base || 'USDT').trim().toUpperCase();
 
-  // 3. Determinar Naturaleza de Operación
+  // 3. Determinar Naturaleza de la Operación (A, D, P)
   let tipoCalculado = item.tipo || item.tipo_op1 || item.naturaleza;
   if (!tipoCalculado || tipoCalculado === 'D') {
     if (moneda && monBase1 && moneda === monBase1) tipoCalculado = 'A';
