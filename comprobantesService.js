@@ -1,6 +1,6 @@
 /**
  * @file comprobantesService.js
- * Lógica determinista con herencia explícita mapeada hacia FUNDDA.
+ * Servicio determinista glaukapi con sanitización estricta de nombres y resolución limpia de tasas.
  */
 
 const db = require('./db');
@@ -11,14 +11,29 @@ if (!rawHubUrl.includes('/api/v1/tasas/calcular')) {
 }
 const TASASHUB_BASE_URL = rawHubUrl;
 
+/**
+ * Normalización de alias de moneda
+ */
 function normalizarCodigoMoneda(moneda) {
   const mon = String(moneda || '').trim().toUpperCase();
   if (mon === 'VES' || mon === 'VEF' || mon === 'VED' || mon === 'BS') return ['VES', 'BS', 'VEF', 'VED'];
   if (mon === 'PEN' || mon === 'SOL' || mon === 'SOLES') return ['PEN', 'SOL', 'SOLES'];
   if (mon === 'ARS' || mon === 'ARG') return ['ARS', 'ARG'];
   if (mon === 'COP') return ['COP'];
-  if (mon === 'USD' || mon === 'USDT') return ['USD', 'USDT'];
+  if (mon === 'USD' || mon === 'USDT') return ['USD', 'USDT', 'ECU'];
   return [mon];
+}
+
+/**
+ * Sanitizador estricto de nombres para URLs de TasasHub
+ */
+function limpiarNombreGrupo(nombre) {
+  if (!nombre) return '';
+  return String(nombre)
+    .trim()
+    .replace(/^FUNDDA\./i, '') // Si viene con prefijo interno FUNDDA.
+    .replace(/[^a-zA-Z0-9_\-]/g, '') // Elimina caracteres extraños
+    .toUpperCase();
 }
 
 function parsearTimestampMsg(ts) {
@@ -58,7 +73,7 @@ async function obtenerPerfilMatrizFundda() {
 }
 
 /**
- * Obtener perfil del grupo en Postgres
+ * Obtener perfil del grupo en Postgres con regla de Herencia
  */
 async function obtenerPerfilGrupo(identificador) {
   if (!identificador || identificador === 'GENERAL' || identificador === 'NO DEFINIDO') {
@@ -86,10 +101,10 @@ async function obtenerPerfilGrupo(identificador) {
       try { perfil.monedas = JSON.parse(perfil.monedas); } catch (e) { perfil.monedas = {}; }
     }
 
-    // 🟢 SI HERENCIA ES TRUE: Apuntamos el identificador de consulta hacia FUNDDA
+    // Si herencia === true -> Usa FUNDDA para consultar TasasHub y hereda sus monedas
     if (perfil.herencia === true) {
       const matrizFundda = await obtenerPerfilMatrizFundda();
-      perfil.grupo_tasashub = 'FUNDDA'; // Entidad a consultar en TasasHub
+      perfil.grupo_tasashub = 'FUNDDA';
       if (matrizFundda && matrizFundda.monedas) {
         perfil.monedas = matrizFundda.monedas;
       }
@@ -168,17 +183,23 @@ async function obtenerLoteTasasPorFecha(timestampMsg) {
   }
 }
 
+/**
+ * Consulta a TasasHub limpia y sanitizada
+ */
 async function consultarTasasHub(nombreGrupo, idLote) {
-  if (!nombreGrupo || nombreGrupo === 'GENERAL' || nombreGrupo === 'NO DEFINIDO') return null;
-  if (String(nombreGrupo).includes('@g.us')) return null;
+  const grupoLimpio = limpiarNombreGrupo(nombreGrupo);
+  if (!grupoLimpio || grupoLimpio === 'GENERAL' || grupoLimpio === 'NODEFINIDO') return null;
 
   try {
-    const grupoQuery = encodeURIComponent(String(nombreGrupo).trim());
-    const loteQuery = idLote ? `?lote=${encodeURIComponent(String(lote).trim())}` : '';
+    const grupoQuery = encodeURIComponent(grupoLimpio);
+    const loteQuery = idLote ? `?lote=${encodeURIComponent(String(idLote).trim())}` : '';
     const url = `${TASASHUB_BASE_URL}/${grupoQuery}${loteQuery}`;
 
     const res = await fetch(url);
-    if (!res.ok) return null;
+    if (!res.ok) {
+      console.warn(`[glaukapi ⚠️ TasasHub HTTP ${res.status}] URL: ${url}`);
+      return null;
+    }
     
     const json = await res.json();
     return json?.data || json;
@@ -241,7 +262,7 @@ async function procesarComprobante(item) {
   const tieneMonedaS1 = socioTieneMonedaConfigurada(perfil1, moneda);
   const tieneMonedaS2 = socioTieneMonedaConfigurada(perfil2, moneda);
 
-  // 🟢 SI TIENE HERENCIA TRUE -> Consulta TasasHub con "FUNDDA"
+  // Nombre limpio para TasasHub (si hereda true usa "FUNDDA", de lo contrario su propio nombre)
   const targetTasas1 = perfil1?.grupo_tasashub || nombreGrupo1;
   const targetTasas2 = perfil2?.grupo_tasashub || nombreGrupo2;
 
