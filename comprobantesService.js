@@ -1,7 +1,6 @@
 /**
  * @file comprobantesService.js
- * Resolución determinista de tasas con regla de Herencia estricta a FUNDDA.
- * Si herencia === false y no existe la moneda en el perfil, retorna "N/A".
+ * Lógica determinista con herencia explícita mapeada hacia FUNDDA.
  */
 
 const db = require('./db');
@@ -35,7 +34,7 @@ function parsearTimestampMsg(ts) {
 }
 
 /**
- * Consulta el perfil matriz FUNDDA
+ * Consulta el perfil matriz de FUNDDA
  */
 async function obtenerPerfilMatrizFundda() {
   try {
@@ -53,13 +52,13 @@ async function obtenerPerfilMatrizFundda() {
     }
     return perfil;
   } catch (err) {
-    console.error(`[glaukapi ❌ Error buscando perfil matriz FUNDDA]:`, err.message);
+    console.error(`[glaukapi ❌ Error DB FUNDDA]:`, err.message);
     return null;
   }
 }
 
 /**
- * 🟢 OBTENER PERFIL CON REGLA ESTRICTA DE HERENCIA
+ * Obtener perfil del grupo en Postgres
  */
 async function obtenerPerfilGrupo(identificador) {
   if (!identificador || identificador === 'GENERAL' || identificador === 'NO DEFINIDO') {
@@ -87,16 +86,18 @@ async function obtenerPerfilGrupo(identificador) {
       try { perfil.monedas = JSON.parse(perfil.monedas); } catch (e) { perfil.monedas = {}; }
     }
 
-    // 🟢 REGLA ESTRICTA DE HERENCIA: ÚNICAMENTE SI herencia === true
+    // 🟢 SI HERENCIA ES TRUE: Apuntamos el identificador de consulta hacia FUNDDA
     if (perfil.herencia === true) {
       const matrizFundda = await obtenerPerfilMatrizFundda();
-      perfil.hereda_tasas_de = 'FUNDDA';
+      perfil.grupo_tasashub = 'FUNDDA'; // Entidad a consultar en TasasHub
       if (matrizFundda && matrizFundda.monedas) {
-        perfil.monedas = { ...matrizFundda.monedas, ...(perfil.monedas || {}) };
+        perfil.monedas = matrizFundda.monedas;
       }
       if (!perfil.moneda_base && matrizFundda?.moneda_base) {
         perfil.moneda_base = matrizFundda.moneda_base;
       }
+    } else {
+      perfil.grupo_tasashub = perfil.nombre;
     }
 
     return perfil;
@@ -106,9 +107,6 @@ async function obtenerPerfilGrupo(identificador) {
   }
 }
 
-/**
- * Validar si el socio puede operar esa moneda de forma explícita o por herencia
- */
 function socioTieneMonedaConfigurada(perfil, moneda) {
   if (!perfil || !perfil.monedas) return false;
   const codigos = normalizarCodigoMoneda(moneda);
@@ -116,7 +114,6 @@ function socioTieneMonedaConfigurada(perfil, moneda) {
   if (!keyMoneda) return false;
 
   const config = perfil.monedas[keyMoneda];
-  // Si existe en el mapa y está activa (o no declara activo = false)
   return config && config.activo !== false;
 }
 
@@ -177,7 +174,7 @@ async function consultarTasasHub(nombreGrupo, idLote) {
 
   try {
     const grupoQuery = encodeURIComponent(String(nombreGrupo).trim());
-    const loteQuery = idLote ? `?lote=${encodeURIComponent(String(idLote).trim())}` : '';
+    const loteQuery = idLote ? `?lote=${encodeURIComponent(String(lote).trim())}` : '';
     const url = `${TASASHUB_BASE_URL}/${grupoQuery}${loteQuery}`;
 
     const res = await fetch(url);
@@ -240,15 +237,14 @@ async function procesarComprobante(item) {
   const nombreGrupo1 = perfil1?.nombre || rawGrupo1;
   const nombreGrupo2 = perfil2?.nombre || rawGrupo2;
 
-  // 2. 🟢 VALIDACIÓN ESTRICTA DE POOL DE MONEDAS / HERENCIA
+  // 2. Verificar pool de monedas
   const tieneMonedaS1 = socioTieneMonedaConfigurada(perfil1, moneda);
   const tieneMonedaS2 = socioTieneMonedaConfigurada(perfil2, moneda);
 
-  // Determinar si se consulta a TasasHub con "FUNDDA" (si herencia === true) o con su propio nombre
-  const targetTasas1 = perfil1?.hereda_tasas_de || nombreGrupo1;
-  const targetTasas2 = perfil2?.hereda_tasas_de || nombreGrupo2;
+  // 🟢 SI TIENE HERENCIA TRUE -> Consulta TasasHub con "FUNDDA"
+  const targetTasas1 = perfil1?.grupo_tasashub || nombreGrupo1;
+  const targetTasas2 = perfil2?.grupo_tasashub || nombreGrupo2;
 
-  // Consultar a TasasHub ÚNICAMENTE si el socio tiene la moneda en su pool o es herencia
   const [dataHub1, dataHub2] = await Promise.all([
     tieneMonedaS1 ? consultarTasasHub(targetTasas1, loteCodigo) : null,
     tieneMonedaS2 ? consultarTasasHub(targetTasas2, loteCodigo) : null
@@ -257,7 +253,7 @@ async function procesarComprobante(item) {
   const monBase1 = String(perfil1?.moneda_base || 'USDT').trim().toUpperCase();
   const monBase2 = String(perfil2?.moneda_base || 'USDT').trim().toUpperCase();
 
-  // 3. Determinar Naturaleza de la Operación
+  // 3. Determinar Naturaleza de Operación
   let tipoCalculado = item.tipo || item.tipo_op1 || item.naturaleza;
   if (!tipoCalculado || tipoCalculado === 'D') {
     if (moneda && monBase1 && moneda === monBase1) tipoCalculado = 'A';
