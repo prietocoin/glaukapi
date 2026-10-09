@@ -1,37 +1,41 @@
 /**
  * @file comprobantesService.js
- * @description Servicio de resolución determinista para glaukapi por id_grupo (JID) / perfiles_glaukov.
+ * @description Lógica diagnóstica y resolución atómica de JID -> Nombre para glaukapi.
  */
 
 const db = require('./db');
 
-// Formatear URL base de TasasHub asegurando endpoint completo
 let rawHubUrl = process.env.TASASHUB_URL || 'https://automat-tasashub.fyi6ur.easypanel.host';
 if (!rawHubUrl.includes('/api/v1/tasas/calcular')) {
   rawHubUrl = rawHubUrl.replace(/\/+$/, '') + '/api/v1/tasas/calcular';
 }
 const TASASHUB_BASE_URL = rawHubUrl;
-const REMITHUB_BASE_URL = process.env.REMITHUB_URL || 'https://automat-remithub.fyi6ur.easypanel.host/api/comprobantes';
 
 /**
- * Busca en perfiles_glaukov haciendo cruce por id_grupo (JID) o por nombre de grupo.
+ * Consulta profiláctica de perfiles_glaukov con logs en consola.
  */
 async function obtenerPerfilGrupo(identificador) {
   if (!identificador || identificador === 'GENERAL' || identificador === 'NO DEFINIDO') return null;
 
   try {
-    const val = String(identificador).trim();
+    const rawVal = String(identificador).trim();
+    // Extraer solo la parte numérica si viene como JID de WhatsApp (ej: 120363405854886633)
+    const numericPart = rawVal.split('@')[0];
 
-    // Cruce directo contra id_grupo (JID) o nombre
     const query = `
       SELECT id_grupo, nombre, moneda_base, monedas 
       FROM perfiles_glaukov 
       WHERE UPPER(TRIM(id_grupo)) = UPPER(TRIM($1))
          OR UPPER(TRIM(nombre)) = UPPER(TRIM($1))
+         OR id_grupo LIKE $2
       LIMIT 1;
     `;
-    const { rows } = await db.query(query, [val]);
-    if (!rows[0]) return null;
+    const { rows } = await db.query(query, [rawVal, `%${numericPart}%`]);
+
+    if (!rows[0]) {
+      console.warn(`[glaukapi ⚠️ DB Miss]: No se encontró perfil para identificador: "${rawVal}"`);
+      return null;
+    }
 
     const perfil = rows[0];
     if (typeof perfil.monedas === 'string') {
@@ -39,14 +43,11 @@ async function obtenerPerfilGrupo(identificador) {
     }
     return perfil;
   } catch (err) {
-    console.warn(`[glaukapi ⚠️ DB Error Perfil Grupo ${identificador}]:`, err.message);
+    console.error(`[glaukapi ❌ Error DB Perfiles Query para "${identificador}"]:`, err.message);
     return null;
   }
 }
 
-/**
- * Consulta el lote de cotización en tasas_glaukov.
- */
 async function obtenerLoteTasasGlaukov(idLote) {
   if (!idLote) return null;
   try {
@@ -69,9 +70,6 @@ async function obtenerLoteTasasGlaukov(idLote) {
   }
 }
 
-/**
- * Consulta TasasHub enviando el nombre legible del grupo y el lote.
- */
 async function consultarTasasHub(nombreGrupo, lote) {
   if (!nombreGrupo || nombreGrupo === 'GENERAL' || nombreGrupo === 'NO DEFINIDO') return null;
 
@@ -81,16 +79,17 @@ async function consultarTasasHub(nombreGrupo, lote) {
     const url = `${TASASHUB_BASE_URL}/${grupoQuery}${loteQuery}`;
 
     const res = await fetch(url);
-    if (!res.ok) return null;
+    if (!res.ok) {
+      console.warn(`[glaukapi ⚠️ TasasHub HTTP ${res.status}] URL: ${url}`);
+      return null;
+    }
     return await res.json();
   } catch (err) {
+    console.warn(`[glaukapi ⚠️ TasasHub Fetch Error]:`, err.message);
     return null;
   }
 }
 
-/**
- * Extrae la tasa exacta (compra o venta) de TasasHub.
- */
 function extraerTasaHub(dataHub, moneda, naturaleza) {
   if (!dataHub || !Array.isArray(dataHub.tarjetas_paises)) return 'N/A';
 
@@ -111,30 +110,26 @@ function extraerTasaHub(dataHub, moneda, naturaleza) {
   return 'N/A';
 }
 
-/**
- * Procesa un comprobante individual cruzando id_grupo -> nombre y resolviendo tasas.
- */
 async function procesarComprobante(item) {
   const lote = String(item.lote_tasa || item.lote_tasa_asignado || item.id_tasa || 'T001').trim();
   const monto = Math.abs(Number(item.monto || item.monto_local || 0));
   const moneda = String(item.moneda || item.moneda_local || '').trim().toUpperCase();
 
-  // 1. Extraer los JIDs/identificadores raw del comprobante
-  const rawGrupo1 = item.grupo_raw_1 || item.nombre_socio_1 || item.socio_1 || item.grupo_1 || 'GENERAL';
-  const rawGrupo2 = item.grupo_raw_2 || item.nombre_socio_2 || item.socio_2 || item.grupo_2 || 'GENERAL';
+  // 1. Mapeo exhaustivo de claves para capturar los JIDs sin importar cómo vengan en la fila
+  const rawGrupo1 = item.id_grupo_1 || item.grupo_raw_1 || item.nombre_socio_1 || item.socio_1 || item.grupo_1 || item.id_chat || 'GENERAL';
+  const rawGrupo2 = item.id_grupo_2 || item.grupo_raw_2 || item.nombre_socio_2 || item.socio_2 || item.grupo_2 || 'GENERAL';
 
-  // 2. Cruce obligatorio con perfiles_glaukov por id_grupo (JID)
+  // 2. Cruce con PostgreSQL
   const [perfil1, perfil2, loteGlaukov] = await Promise.all([
     obtenerPerfilGrupo(rawGrupo1),
     obtenerPerfilGrupo(rawGrupo2),
     obtenerLoteTasasGlaukov(lote)
   ]);
 
-  // Si cruzó en la DB, tomamos el nombre del grupo; si no, dejamos la cadena original
   const nombreGrupo1 = perfil1?.nombre || rawGrupo1;
   const nombreGrupo2 = perfil2?.nombre || rawGrupo2;
 
-  // 3. Consultar a TasasHub usando el nombre del grupo resuelto (ej: "YARELIS")
+  // 3. Consulta a TasasHub con el nombre resuelto
   const [dataHub1, dataHub2] = await Promise.all([
     consultarTasasHub(nombreGrupo1, lote),
     consultarTasasHub(nombreGrupo2, lote)
@@ -152,7 +147,7 @@ async function procesarComprobante(item) {
     else tipoCalculado = 'D';
   }
 
-  // 5. Extracción de Tasas T1 / T2 desde TasasHub
+  // 5. Extracción de Tasas
   let tasa1 = (tipoCalculado === 'A' || monBase1 === moneda) ? 1.00 : extraerTasaHub(dataHub1, moneda, tipoCalculado);
   let tasa2 = (tipoCalculado === 'A' || monBase2 === moneda) ? 1.00 : extraerTasaHub(dataHub2, moneda, tipoCalculado);
 
