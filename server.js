@@ -1,3 +1,9 @@
+/**
+ * @file server.js
+ * @description Punto de entrada principal para glaukapi.
+ */
+
+require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const db = require('./db');
@@ -8,7 +14,7 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// 🟢 ENDPOINT 100% JSON (Sin vistas, sin HTML)
+// Endpoint principal
 app.get('/api/v2/comprobantes', async (req, res) => {
   res.setHeader('Content-Type', 'application/json; charset=utf-8');
   try {
@@ -27,11 +33,16 @@ app.get('/api/v2/comprobantes', async (req, res) => {
 
     return res.status(200).json(resultado);
   } catch (err) {
-    return res.status(500).json({ error: 'Error interno en API V2', detalle: err.message });
+    return res.status(500).json({ error: 'Error interno en glaukapi', detalle: err.message });
   }
+});
+
+// Endpoint de salud
+app.get('/health', (req, res) => {
+  res.status(200).json({ status: 'OK', app: 'glaukapi', timestamp: new Date().toISOString() });
 });
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`🚀 API V2 independiente ejecutándose en puerto ${PORT}`);
+  console.log(`🚀 glaukapi escuchando en el puerto ${PORT}`);
 });
