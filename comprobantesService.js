@@ -1,3 +1,8 @@
+/**
+ * @file comprobantesService.js
+ * @description Servicio de lógica de negocio para glaukapi.
+ */
+
 const db = require('./db');
 
 const TASASHUB_BASE_URL = process.env.TASASHUB_URL || 'https://automat-tasashub.fyi6ur.easypanel.host/api/v1/tasas/calcular';
