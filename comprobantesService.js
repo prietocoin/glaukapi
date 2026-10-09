@@ -1,7 +1,7 @@
 /**
  * @file comprobantesService.js
- * Servicio de lógica de negocio determinista para glaukapi.
- * Consumo explícito de polar_D y polar_P por tipo de operación, con resolución de Herencia.
+ * Resolución determinista de tasas con regla de Herencia estricta a FUNDDA.
+ * Si herencia === false y no existe la moneda en el perfil, retorna "N/A".
  */
 
 const db = require('./db');
@@ -35,42 +35,35 @@ function parsearTimestampMsg(ts) {
 }
 
 /**
- * 🟢 CONSUMO DE POLARIDAD VÍA polar_[tipo] (polar_D / polar_P / Arbitraje A)
+ * Consulta el perfil matriz FUNDDA
  */
-function obtenerPolaridadPorTipo(perfil, moneda, tipoCalculado, esSocio1 = true) {
-  // 1. Caso Abono / Arbitraje (A): Regla fija para la operación
-  if (tipoCalculado === 'A') {
-    return esSocio1 ? '+' : '-';
+async function obtenerPerfilMatrizFundda() {
+  try {
+    const { rows } = await db.query(`
+      SELECT id_grupo, nombre, moneda_base, monedas, herencia 
+      FROM perfiles_glaukov 
+      WHERE UPPER(TRIM(nombre)) = 'FUNDDA' OR id_grupo = '120363401374720092@g.us'
+      LIMIT 1;
+    `);
+    if (!rows[0]) return null;
+
+    const perfil = rows[0];
+    if (typeof perfil.monedas === 'string') {
+      try { perfil.monedas = JSON.parse(perfil.monedas); } catch (e) { perfil.monedas = {}; }
+    }
+    return perfil;
+  } catch (err) {
+    console.error(`[glaukapi ❌ Error buscando perfil matriz FUNDDA]:`, err.message);
+    return null;
   }
-
-  if (!perfil || !perfil.monedas) return '+';
-
-  const codigos = normalizarCodigoMoneda(moneda);
-  const keyMoneda = Object.keys(perfil.monedas).find(m => codigos.includes(m.toUpperCase()));
-
-  if (!keyMoneda) return '+';
-
-  const configMoneda = perfil.monedas[keyMoneda];
-
-  // 2. Consumo directo de polar_D para Depósitos (D)
-  if (tipoCalculado === 'D') {
-    return configMoneda.polar_D !== undefined ? configMoneda.polar_D : '+';
-  }
-
-  // 3. Consumo directo de polar_P para Pagos (P)
-  if (tipoCalculado === 'P') {
-    return configMoneda.polar_P !== undefined ? configMoneda.polar_P : '-';
-  }
-
-  return '+';
 }
 
 /**
- * Obtener perfil del grupo con resolución de Herencia (GRP_GENERAL)
+ * 🟢 OBTENER PERFIL CON REGLA ESTRICTA DE HERENCIA
  */
 async function obtenerPerfilGrupo(identificador) {
   if (!identificador || identificador === 'GENERAL' || identificador === 'NO DEFINIDO') {
-    return obtenerPerfilMatrizGeneral();
+    return null;
   }
 
   try {
@@ -86,46 +79,65 @@ async function obtenerPerfilGrupo(identificador) {
       LIMIT 1;
     `;
     const { rows } = await db.query(query, [rawVal, `%${numericPart}%`]);
-    if (!rows[0]) return obtenerPerfilMatrizGeneral();
+
+    if (!rows[0]) return null;
 
     let perfil = rows[0];
     if (typeof perfil.monedas === 'string') {
       try { perfil.monedas = JSON.parse(perfil.monedas); } catch (e) { perfil.monedas = {}; }
     }
 
-    // Resolver herencia si herencia = true o el mapa de monedas está vacío
-    if (perfil.herencia || !perfil.monedas || Object.keys(perfil.monedas).length === 0) {
-      const matrizGeneral = await obtenerPerfilMatrizGeneral();
-      if (matrizGeneral && matrizGeneral.monedas) {
-        perfil.monedas = { ...matrizGeneral.monedas, ...perfil.monedas };
+    // 🟢 REGLA ESTRICTA DE HERENCIA: ÚNICAMENTE SI herencia === true
+    if (perfil.herencia === true) {
+      const matrizFundda = await obtenerPerfilMatrizFundda();
+      perfil.hereda_tasas_de = 'FUNDDA';
+      if (matrizFundda && matrizFundda.monedas) {
+        perfil.monedas = { ...matrizFundda.monedas, ...(perfil.monedas || {}) };
+      }
+      if (!perfil.moneda_base && matrizFundda?.moneda_base) {
+        perfil.moneda_base = matrizFundda.moneda_base;
       }
     }
 
     return perfil;
   } catch (err) {
     console.error(`[glaukapi ❌ Error DB Perfiles]:`, err.message);
-    return obtenerPerfilMatrizGeneral();
+    return null;
   }
 }
 
-async function obtenerPerfilMatrizGeneral() {
-  try {
-    const { rows } = await db.query(`
-      SELECT id_grupo, nombre, moneda_base, monedas, herencia 
-      FROM perfiles_glaukov 
-      WHERE UPPER(TRIM(nombre)) = 'GENERAL' OR id_grupo = 'GRP_GENERAL' OR rol = 'MATRIZ_GENERAL'
-      LIMIT 1;
-    `);
-    if (!rows[0]) return null;
+/**
+ * Validar si el socio puede operar esa moneda de forma explícita o por herencia
+ */
+function socioTieneMonedaConfigurada(perfil, moneda) {
+  if (!perfil || !perfil.monedas) return false;
+  const codigos = normalizarCodigoMoneda(moneda);
+  const keyMoneda = Object.keys(perfil.monedas).find(m => codigos.includes(m.toUpperCase()));
+  if (!keyMoneda) return false;
 
-    const perfil = rows[0];
-    if (typeof perfil.monedas === 'string') {
-      try { perfil.monedas = JSON.parse(perfil.monedas); } catch (e) { perfil.monedas = {}; }
-    }
-    return perfil;
-  } catch (err) {
-    return null;
+  const config = perfil.monedas[keyMoneda];
+  // Si existe en el mapa y está activa (o no declara activo = false)
+  return config && config.activo !== false;
+}
+
+function obtenerPolaridadPorTipo(perfil, moneda, tipoCalculado, esSocio1 = true) {
+  if (tipoCalculado === 'A') return esSocio1 ? '+' : '-';
+  if (!perfil || !perfil.monedas) return '+';
+
+  const codigos = normalizarCodigoMoneda(moneda);
+  const keyMoneda = Object.keys(perfil.monedas).find(m => codigos.includes(m.toUpperCase()));
+  if (!keyMoneda) return '+';
+
+  const configMoneda = perfil.monedas[keyMoneda];
+
+  if (tipoCalculado === 'D') {
+    return configMoneda.polar_D !== undefined ? configMoneda.polar_D : (configMoneda.polaridad || '+');
   }
+  if (tipoCalculado === 'P') {
+    return configMoneda.polar_P !== undefined ? configMoneda.polar_P : (configMoneda.polaridad || '-');
+  }
+
+  return '+';
 }
 
 async function obtenerLoteTasasPorFecha(timestampMsg) {
@@ -216,7 +228,7 @@ async function procesarComprobante(item) {
   const rawGrupo1 = item.id_grupo_1 || item.grupo_raw_1 || item.nombre_socio_1 || item.socio_1 || item.grupo_1 || item.id_chat || 'GENERAL';
   const rawGrupo2 = item.id_grupo_2 || item.grupo_raw_2 || item.nombre_socio_2 || item.socio_2 || item.grupo_2 || 'GENERAL';
 
-  // 1. Resolver perfiles con herencia
+  // 1. Resolver perfiles
   const [perfil1, perfil2, loteGlaukov] = await Promise.all([
     obtenerPerfilGrupo(rawGrupo1),
     obtenerPerfilGrupo(rawGrupo2),
@@ -224,19 +236,28 @@ async function procesarComprobante(item) {
   ]);
 
   const loteCodigo = loteGlaukov?.id_tasa || 'T001';
+
   const nombreGrupo1 = perfil1?.nombre || rawGrupo1;
   const nombreGrupo2 = perfil2?.nombre || rawGrupo2;
 
-  // 2. Consultar a TasasHub
+  // 2. 🟢 VALIDACIÓN ESTRICTA DE POOL DE MONEDAS / HERENCIA
+  const tieneMonedaS1 = socioTieneMonedaConfigurada(perfil1, moneda);
+  const tieneMonedaS2 = socioTieneMonedaConfigurada(perfil2, moneda);
+
+  // Determinar si se consulta a TasasHub con "FUNDDA" (si herencia === true) o con su propio nombre
+  const targetTasas1 = perfil1?.hereda_tasas_de || nombreGrupo1;
+  const targetTasas2 = perfil2?.hereda_tasas_de || nombreGrupo2;
+
+  // Consultar a TasasHub ÚNICAMENTE si el socio tiene la moneda en su pool o es herencia
   const [dataHub1, dataHub2] = await Promise.all([
-    consultarTasasHub(nombreGrupo1, loteCodigo),
-    consultarTasasHub(nombreGrupo2, loteCodigo)
+    tieneMonedaS1 ? consultarTasasHub(targetTasas1, loteCodigo) : null,
+    tieneMonedaS2 ? consultarTasasHub(targetTasas2, loteCodigo) : null
   ]);
 
   const monBase1 = String(perfil1?.moneda_base || 'USDT').trim().toUpperCase();
   const monBase2 = String(perfil2?.moneda_base || 'USDT').trim().toUpperCase();
 
-  // 3. Determinar Naturaleza de la Operación (A, D, P)
+  // 3. Determinar Naturaleza de la Operación
   let tipoCalculado = item.tipo || item.tipo_op1 || item.naturaleza;
   if (!tipoCalculado || tipoCalculado === 'D') {
     if (moneda && monBase1 && moneda === monBase1) tipoCalculado = 'A';
@@ -246,8 +267,15 @@ async function procesarComprobante(item) {
   }
 
   // 4. Extracción de Tasas T1 y T2
-  let tasa1 = (tipoCalculado === 'A' || monBase1 === moneda) ? 1.00 : extraerTasaHub(dataHub1, moneda, tipoCalculado);
-  let tasa2 = (tipoCalculado === 'A' || monBase2 === moneda) ? 1.00 : extraerTasaHub(dataHub2, moneda, tipoCalculado);
+  let tasa1 = 'N/A';
+  if (tieneMonedaS1) {
+    tasa1 = (tipoCalculado === 'A' || monBase1 === moneda) ? 1.00 : extraerTasaHub(dataHub1, moneda, tipoCalculado);
+  }
+
+  let tasa2 = 'N/A';
+  if (tieneMonedaS2) {
+    tasa2 = (tipoCalculado === 'A' || monBase2 === moneda) ? 1.00 : extraerTasaHub(dataHub2, moneda, tipoCalculado);
+  }
 
   const numT1 = Number(tasa1);
   const numT2 = Number(tasa2);
@@ -259,7 +287,7 @@ async function procesarComprobante(item) {
   const me1 = tasaMeBase > 0 ? Number((monto / tasaMeBase).toFixed(2)) : monto1;
   const me2 = tasaMeBase > 0 ? Number((monto / tasaMeBase).toFixed(2)) : monto2;
 
-  // 5. 🟢 EVALUACIÓN EXPLICITA DE POLARIDAD CONSUMIENDO polar_D / polar_P
+  // 5. Polaridades
   const polaridad1 = obtenerPolaridadPorTipo(perfil1, moneda, tipoCalculado, true);
   const polaridad2 = obtenerPolaridadPorTipo(perfil2, moneda, tipoCalculado, false);
 
