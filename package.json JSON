@@ -1,0 +1,25 @@
+{
+  "name": "glaukapi",
+  "version": "2.0.0",
+  "description": "Microservicio API independiente para cálculo determinista de tasas T1/T2 y procesamiento de comprobantes",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "keywords": [
+    "glaukapi",
+    "api",
+    "express",
+    "tasashub",
+    "postgresql"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "pg": "^8.11.5"
+  }
+}
