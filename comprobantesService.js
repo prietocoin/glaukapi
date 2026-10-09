@@ -1,6 +1,6 @@
 /**
  * @file comprobantesService.js
- * Lógica determinista con resolución dinámica de lote por fecha de primer impacto.
+ * Lógica corregida para manejo de fechas válidas y resolución de tasas en TasasHub.
  */
 
 const db = require('./db');
@@ -51,16 +51,15 @@ async function obtenerPerfilGrupo(identificador) {
 }
 
 /**
- * 🟢 BUSCAR LOTE DINÁMICO POR FECHA DE PRIMER IMPACTO
- * Encuentra el lote publicado en tasas_glaukov con la fecha más próxima anterior o igual.
+ * 🟢 BUSCAR LOTE POR FECHA (Parseo robusto de timestamps ISO / MySQL)
  */
-async function obtenerLoteTasasPorFecha(fechaImpacto, idLoteForzado = null) {
+async function obtenerLoteTasasPorFecha(fechaRaw, idLoteExplicit = null) {
   try {
-    // Si viene un id_tasa/lote explícito en el comprobante, intentar buscarlo directamente primero
-    if (idLoteForzado) {
+    // Si viene un lote expreso y no es el placeholder T001, probarlo primero
+    if (idLoteExplicit && idLoteExplicit !== 'T001') {
       const { rows } = await db.query(
         'SELECT id_tasa, tasas, fecha FROM tasas_glaukov WHERE UPPER(TRIM(id_tasa)) = UPPER(TRIM($1)) LIMIT 1;',
-        [idLoteForzado]
+        [idLoteExplicit]
       );
       if (rows[0]) {
         const loteObj = rows[0];
@@ -71,9 +70,13 @@ async function obtenerLoteTasasPorFecha(fechaImpacto, idLoteForzado = null) {
       }
     }
 
-    // Si no hay lote forzado o no existe, buscar por fecha <= fechaImpacto
-    const targetDate = fechaImpacto ? new Date(fechaImpacto) : new Date();
+    // Normalizar la fecha del primer impacto
+    let dateObj = new Date(fechaRaw);
+    if (isNaN(dateObj.getTime())) {
+      dateObj = new Date(); // Fallback a la hora actual si no viene fecha en el comprobante
+    }
 
+    // Buscar el lote publicado en la fecha igual o más próxima anterior
     const query = `
       SELECT id_tasa, tasas, fecha 
       FROM tasas_glaukov 
@@ -81,13 +84,12 @@ async function obtenerLoteTasasPorFecha(fechaImpacto, idLoteForzado = null) {
       ORDER BY fecha DESC 
       LIMIT 1;
     `;
-    const { rows } = await db.query(query, [targetDate]);
+    const { rows } = await db.query(query, [dateObj]);
 
-    // Fallback: si el comprobante es más antiguo que cualquier registro, traer la tasa publicada más antigua disponible
     let loteObj = rows[0];
     if (!loteObj) {
-      const fallbackQuery = 'SELECT id_tasa, tasas, fecha FROM tasas_glaukov ORDER BY fecha ASC LIMIT 1;';
-      const fallbackRes = await db.query(fallbackQuery);
+      // Si el comprobante es más antiguo que los lotes registrados, traer el lote más reciente
+      const fallbackRes = await db.query('SELECT id_tasa, tasas, fecha FROM tasas_glaukov ORDER BY fecha DESC LIMIT 1;');
       loteObj = fallbackRes.rows[0];
     }
 
@@ -99,7 +101,7 @@ async function obtenerLoteTasasPorFecha(fechaImpacto, idLoteForzado = null) {
     return loteObj;
 
   } catch (err) {
-    console.error(`[glaukapi ❌ Error buscando Lote por fecha ${fechaImpacto}]:`, err.message);
+    console.error(`[glaukapi ❌ Error Lote Query por fecha]:`, err.message);
     return null;
   }
 }
@@ -124,6 +126,9 @@ async function consultarTasasHub(nombreGrupo, idLote) {
   }
 }
 
+/**
+ * 🟢 EXTRACCIÓN CON FALLBACK (Prueba Compra primero, si es 0/null toma Venta)
+ */
 function extraerTasaHub(dataHub, moneda, naturaleza) {
   if (!dataHub || !Array.isArray(dataHub.tarjetas_paises)) return 'N/A';
 
@@ -137,30 +142,36 @@ function extraerTasaHub(dataHub, moneda, naturaleza) {
 
   if (!tarjeta) return 'N/A';
 
+  const compra = Number(tarjeta.compra);
+  const venta = Number(tarjeta.venta);
+
   if (nat === 'D') {
-    const val = Number(tarjeta.compra);
-    return !isNaN(val) && val > 0 ? val : 'N/A';
+    if (!isNaN(compra) && compra > 0) return compra;
+    if (!isNaN(venta) && venta > 0) return venta;
   }
   if (nat === 'P') {
-    const val = Number(tarjeta.venta);
-    return !isNaN(val) && val > 0 ? val : 'N/A';
+    if (!isNaN(venta) && venta > 0) return venta;
+    if (!isNaN(compra) && compra > 0) return compra;
   }
-  return 'N/A';
+
+  // Fallback directo a cualquier valor numérico válido
+  const numGeneral = !isNaN(compra) && compra > 0 ? compra : (!isNaN(venta) && venta > 0 ? venta : 'N/A');
+  return numGeneral;
 }
 
 async function procesarComprobante(item) {
   const monto = Math.abs(Number(item.monto || item.monto_local || 0));
   const moneda = String(item.moneda || item.moneda_local || '').trim().toUpperCase();
 
-  // 1. Obtener la Fecha de Primer Impacto del Comprobante
-  const fechaImpacto = item.created_at || item.fecha || item.fecha_creacion || item.timestamp || new Date();
+  // 1. Extraer timestamp del comprobante (campos posibles en la DB)
+  const fechaImpacto = item.created_at || item.createdat || item.fecha || item.fecha_registro || item.timestamp;
   const idLoteExplicit = item.lote_tasa || item.lote_tasa_asignado || item.id_tasa;
 
-  // 2. Extraer identificadores raw de grupos
+  // 2. Extraer JIDs
   const rawGrupo1 = item.id_grupo_1 || item.grupo_raw_1 || item.nombre_socio_1 || item.socio_1 || item.grupo_1 || item.id_chat || 'GENERAL';
   const rawGrupo2 = item.id_grupo_2 || item.grupo_raw_2 || item.nombre_socio_2 || item.socio_2 || item.grupo_2 || 'GENERAL';
 
-  // 3. Resolver perfiles y obtener el Lote por la fecha más próxima anterior
+  // 3. Resolver perfiles y lote correspondiente
   const [perfil1, perfil2, loteGlaukov] = await Promise.all([
     obtenerPerfilGrupo(rawGrupo1),
     obtenerPerfilGrupo(rawGrupo2),
@@ -171,7 +182,7 @@ async function procesarComprobante(item) {
   const nombreGrupo1 = perfil1?.nombre || rawGrupo1;
   const nombreGrupo2 = perfil2?.nombre || rawGrupo2;
 
-  // 4. Consultar TasasHub enviando el código de lote dinámico resuelto
+  // 4. Consultar TasasHub
   const [dataHub1, dataHub2] = await Promise.all([
     consultarTasasHub(nombreGrupo1, loteCodigo),
     consultarTasasHub(nombreGrupo2, loteCodigo)
@@ -180,7 +191,7 @@ async function procesarComprobante(item) {
   const monBase1 = String(perfil1?.moneda_base || 'USDT').trim().toUpperCase();
   const monBase2 = String(perfil2?.moneda_base || 'USDT').trim().toUpperCase();
 
-  // 5. Determinar Naturaleza de la Operación (A, D, P)
+  // 5. Naturaleza de Operación (A, D, P)
   let tipoCalculado = item.tipo || item.tipo_op1 || item.naturaleza;
   if (!tipoCalculado || tipoCalculado === 'D') {
     if (moneda && monBase1 && moneda === monBase1) tipoCalculado = 'A';
