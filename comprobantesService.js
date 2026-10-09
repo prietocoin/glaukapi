@@ -1,6 +1,6 @@
 /**
  * @file comprobantesService.js
- * Lógica corregida para manejo de fechas válidas y resolución de tasas en TasasHub.
+ * Mapeo exacto de timestamp_msg de RemitHub y cálculo determinista.
  */
 
 const db = require('./db');
@@ -19,6 +19,22 @@ function normalizarCodigoMoneda(moneda) {
   if (mon === 'COP') return ['COP'];
   if (mon === 'USD' || mon === 'USDT') return ['USD', 'USDT'];
   return [mon];
+}
+
+/**
+ * Parsea el timestamp_msg de RemitHub a objeto Date valido de JavaScript
+ */
+function parsearTimestampMsg(ts) {
+  if (!ts) return new Date();
+  
+  const num = Number(ts);
+  if (isNaN(num) || num <= 0) return new Date();
+
+  // Si el timestamp esta en segundos (10 digitos ej: 1791580715), multiplicar por 1000
+  if (String(num).length === 10) {
+    return new Date(num * 1000);
+  }
+  return new Date(num);
 }
 
 async function obtenerPerfilGrupo(identificador) {
@@ -51,11 +67,10 @@ async function obtenerPerfilGrupo(identificador) {
 }
 
 /**
- * 🟢 BUSCAR LOTE POR FECHA (Parseo robusto de timestamps ISO / MySQL)
+ * Consulta el lote publicado mas reciente anterior o igual al timestamp_msg del comprobante
  */
-async function obtenerLoteTasasPorFecha(fechaRaw, idLoteExplicit = null) {
+async function obtenerLoteTasasPorFecha(timestampMsg, idLoteExplicit = null) {
   try {
-    // Si viene un lote expreso y no es el placeholder T001, probarlo primero
     if (idLoteExplicit && idLoteExplicit !== 'T001') {
       const { rows } = await db.query(
         'SELECT id_tasa, tasas, fecha FROM tasas_glaukov WHERE UPPER(TRIM(id_tasa)) = UPPER(TRIM($1)) LIMIT 1;',
@@ -70,13 +85,8 @@ async function obtenerLoteTasasPorFecha(fechaRaw, idLoteExplicit = null) {
       }
     }
 
-    // Normalizar la fecha del primer impacto
-    let dateObj = new Date(fechaRaw);
-    if (isNaN(dateObj.getTime())) {
-      dateObj = new Date(); // Fallback a la hora actual si no viene fecha en el comprobante
-    }
+    const dateObj = parsearTimestampMsg(timestampMsg);
 
-    // Buscar el lote publicado en la fecha igual o más próxima anterior
     const query = `
       SELECT id_tasa, tasas, fecha 
       FROM tasas_glaukov 
@@ -88,7 +98,6 @@ async function obtenerLoteTasasPorFecha(fechaRaw, idLoteExplicit = null) {
 
     let loteObj = rows[0];
     if (!loteObj) {
-      // Si el comprobante es más antiguo que los lotes registrados, traer el lote más reciente
       const fallbackRes = await db.query('SELECT id_tasa, tasas, fecha FROM tasas_glaukov ORDER BY fecha DESC LIMIT 1;');
       loteObj = fallbackRes.rows[0];
     }
@@ -101,7 +110,7 @@ async function obtenerLoteTasasPorFecha(fechaRaw, idLoteExplicit = null) {
     return loteObj;
 
   } catch (err) {
-    console.error(`[glaukapi ❌ Error Lote Query por fecha]:`, err.message);
+    console.error(`[glaukapi ❌ Error Lote Query]:`, err.message);
     return null;
   }
 }
@@ -126,9 +135,6 @@ async function consultarTasasHub(nombreGrupo, idLote) {
   }
 }
 
-/**
- * 🟢 EXTRACCIÓN CON FALLBACK (Prueba Compra primero, si es 0/null toma Venta)
- */
 function extraerTasaHub(dataHub, moneda, naturaleza) {
   if (!dataHub || !Array.isArray(dataHub.tarjetas_paises)) return 'N/A';
 
@@ -154,28 +160,26 @@ function extraerTasaHub(dataHub, moneda, naturaleza) {
     if (!isNaN(compra) && compra > 0) return compra;
   }
 
-  // Fallback directo a cualquier valor numérico válido
-  const numGeneral = !isNaN(compra) && compra > 0 ? compra : (!isNaN(venta) && venta > 0 ? venta : 'N/A');
-  return numGeneral;
+  return !isNaN(compra) && compra > 0 ? compra : (!isNaN(venta) && venta > 0 ? venta : 'N/A');
 }
 
 async function procesarComprobante(item) {
   const monto = Math.abs(Number(item.monto || item.monto_local || 0));
   const moneda = String(item.moneda || item.moneda_local || '').trim().toUpperCase();
 
-  // 1. Extraer timestamp del comprobante (campos posibles en la DB)
-  const fechaImpacto = item.created_at || item.createdat || item.fecha || item.fecha_registro || item.timestamp;
+  // 1. CAPTURA DEL TIMESTAMP REAL DE REMITHUB ("timestamp_msg")
+  const tsMsg = item.timestamp_msg || item.created_at || item.fecha;
   const idLoteExplicit = item.lote_tasa || item.lote_tasa_asignado || item.id_tasa;
 
   // 2. Extraer JIDs
   const rawGrupo1 = item.id_grupo_1 || item.grupo_raw_1 || item.nombre_socio_1 || item.socio_1 || item.grupo_1 || item.id_chat || 'GENERAL';
   const rawGrupo2 = item.id_grupo_2 || item.grupo_raw_2 || item.nombre_socio_2 || item.socio_2 || item.grupo_2 || 'GENERAL';
 
-  // 3. Resolver perfiles y lote correspondiente
+  // 3. Resolver perfiles y lote correspondiente usando timestamp_msg
   const [perfil1, perfil2, loteGlaukov] = await Promise.all([
     obtenerPerfilGrupo(rawGrupo1),
     obtenerPerfilGrupo(rawGrupo2),
-    obtenerLoteTasasPorFecha(fechaImpacto, idLoteExplicit)
+    obtenerLoteTasasPorFecha(tsMsg, idLoteExplicit)
   ]);
 
   const loteCodigo = loteGlaukov?.id_tasa || 'T001';
@@ -191,7 +195,7 @@ async function procesarComprobante(item) {
   const monBase1 = String(perfil1?.moneda_base || 'USDT').trim().toUpperCase();
   const monBase2 = String(perfil2?.moneda_base || 'USDT').trim().toUpperCase();
 
-  // 5. Naturaleza de Operación (A, D, P)
+  // 5. Naturaleza de Operacion (A, D, P)
   let tipoCalculado = item.tipo || item.tipo_op1 || item.naturaleza;
   if (!tipoCalculado || tipoCalculado === 'D') {
     if (moneda && monBase1 && moneda === monBase1) tipoCalculado = 'A';
@@ -200,7 +204,7 @@ async function procesarComprobante(item) {
     else tipoCalculado = 'D';
   }
 
-  // 6. Extracción de Tasas T1 / T2
+  // 6. Extraccion de Tasas T1 / T2
   let tasa1 = (tipoCalculado === 'A' || monBase1 === moneda) ? 1.00 : extraerTasaHub(dataHub1, moneda, tipoCalculado);
   let tasa2 = (tipoCalculado === 'A' || monBase2 === moneda) ? 1.00 : extraerTasaHub(dataHub2, moneda, tipoCalculado);
 
