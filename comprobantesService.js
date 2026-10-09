@@ -1,11 +1,11 @@
 /**
  * @file comprobantesService.js
- * @description Servicio de lógica de negocio para glaukapi con resolución de Grupos (JIDs/Nombres) y TasasHub.
+ * @description Servicio unificado para glaukapi. Lógica limpia de cruce por JID/Grupo.
  */
 
 const db = require('./db');
 
-// Normalizar URL base de TasasHub asegurando la ruta completa
+// Formatear URL base de TasasHub de forma transparente
 let rawHubUrl = process.env.TASASHUB_URL || 'https://automat-tasashub.fyi6ur.easypanel.host';
 if (!rawHubUrl.includes('/api/v1/tasas/calcular')) {
   rawHubUrl = rawHubUrl.replace(/\/+$/, '') + '/api/v1/tasas/calcular';
@@ -14,15 +14,15 @@ const TASASHUB_BASE_URL = rawHubUrl;
 const REMITHUB_BASE_URL = process.env.REMITHUB_URL || 'https://automat-remithub.fyi6ur.easypanel.host/api/comprobantes';
 
 /**
- * Consulta el perfil de la entidad buscando por Nombre de Grupo o JID de Grupo.
+ * Cruce estricto en perfiles_glaukov por Nombre o por JID de WhatsApp (id_grupo).
  */
-async function obtenerPerfilGrupo(identificadorGrupo) {
-  if (!identificadorGrupo || identificadorGrupo === 'GENERAL' || identificadorGrupo === 'NO DEFINIDO') return null;
+async function obtenerPerfil(identificador) {
+  if (!identificador || identificador === 'GENERAL' || identificador === 'NO DEFINIDO') return null;
 
   try {
-    const val = String(identificadorGrupo).trim();
-    
-    // Búsqueda cruzada: por nombre comercial o id_grupo (JID de WhatsApp)
+    const val = String(identificador).trim();
+
+    // Busca coincidencia en la columna 'nombre' O en la columna 'id_grupo' (JID)
     const query = `
       SELECT nombre, id_grupo, moneda_base, monedas 
       FROM perfiles_glaukov 
@@ -39,7 +39,7 @@ async function obtenerPerfilGrupo(identificadorGrupo) {
     }
     return perfil;
   } catch (err) {
-    console.warn(`[glaukapi ⚠️ DB Error Perfil Grupo ${identificadorGrupo}]:`, err.message);
+    console.warn(`[glaukapi ⚠️ Error DB buscando perfil ${identificador}]:`, err.message);
     return null;
   }
 }
@@ -70,24 +70,20 @@ async function obtenerLoteTasasGlaukov(idLote) {
 }
 
 /**
- * Consulta las tarjetas del Grupo a TasasHub pasando el lote.
+ * Consulta TasasHub con el identificador resuelto.
  */
-async function consultarTasasHub(identificadorGrupo, lote) {
-  if (!identificadorGrupo || identificadorGrupo === 'GENERAL' || identificadorGrupo === 'NO DEFINIDO') return null;
+async function consultarTasasHub(identificador, lote) {
+  if (!identificador || identificador === 'GENERAL' || identificador === 'NO DEFINIDO') return null;
 
   try {
-    const grupoQuery = encodeURIComponent(String(identificadorGrupo).trim());
+    const targetQuery = encodeURIComponent(String(identificador).trim());
     const loteQuery = lote ? `?lote=${encodeURIComponent(String(lote).trim())}` : '';
-    const url = `${TASASHUB_BASE_URL}/${grupoQuery}${loteQuery}`;
+    const url = `${TASASHUB_BASE_URL}/${targetQuery}${loteQuery}`;
 
     const res = await fetch(url);
-    if (!res.ok) {
-      console.warn(`[glaukapi ⚠️ TasasHub HTTP ${res.status}] URL: ${url}`);
-      return null;
-    }
+    if (!res.ok) return null;
     return await res.json();
   } catch (err) {
-    console.warn(`[glaukapi ⚠️ TasasHub Fetch Error]:`, err.message);
     return null;
   }
 }
@@ -116,47 +112,47 @@ function extraerTasaHub(dataHub, moneda, naturaleza) {
 }
 
 /**
- * Procesa un comprobante mapeando grupo_1 y grupo_2.
+ * Procesa un comprobante con contrato JSON limpio (Un solo campo por Grupo).
  */
 async function procesarComprobante(item) {
   const lote = String(item.lote_tasa || item.lote_tasa_asignado || item.id_tasa || 'T001').trim();
   const monto = Math.abs(Number(item.monto || item.monto_local || 0));
   const moneda = String(item.moneda || item.moneda_local || '').trim().toUpperCase();
 
-  // 1. Identificadores de Grupo (JID o Nombre)
-  const rawGrupo1 = item.grupo_raw_1 || item.nombre_socio_1 || item.socio_1 || 'GENERAL';
-  const rawGrupo2 = item.grupo_raw_2 || item.nombre_socio_2 || item.socio_2 || 'GENERAL';
+  // 1. Recibir los JIDs o nombres raw de los grupos
+  const raw1 = item.grupo_raw_1 || item.nombre_socio_1 || item.socio_1 || item.grupo_1 || 'GENERAL';
+  const raw2 = item.grupo_raw_2 || item.nombre_socio_2 || item.socio_2 || item.grupo_2 || 'GENERAL';
 
-  // 2. Buscar perfil de Grupo en Postgres
-  const [perfilGrupo1, perfilGrupo2, loteGlaukov] = await Promise.all([
-    obtenerPerfilGrupo(rawGrupo1),
-    obtenerPerfilGrupo(rawGrupo2),
+  // 2. Cruce obligatorio con PostgreSQL perfiles_glaukov
+  const [perfil1, perfil2, loteGlaukov] = await Promise.all([
+    obtenerPerfil(raw1),
+    obtenerPerfil(raw2),
     obtenerLoteTasasGlaukov(lote)
   ]);
 
-  // Si existe el perfil, usar el Nombre Humano del Grupo; de lo contrario, mantener el identificador raw
-  const nombreGrupo1 = perfilGrupo1?.nombre || rawGrupo1;
-  const nombreGrupo2 = perfilGrupo2?.nombre || rawGrupo2;
+  // Si encontró en DB usas perfil1.nombre; si no, usas la cadena raw
+  const g1Identificador = perfil1?.nombre || raw1;
+  const g2Identificador = perfil2?.nombre || raw2;
 
-  // 3. Consultar TasasHub usando el Nombre de Grupo o JID
+  // 3. Consulta a TasasHub usando el identificador resuelto
   const [dataHub1, dataHub2] = await Promise.all([
-    consultarTasasHub(nombreGrupo1, lote),
-    consultarTasasHub(nombreGrupo2, lote)
+    consultarTasasHub(g1Identificador, lote),
+    consultarTasasHub(g2Identificador, lote)
   ]);
 
-  const monBase1 = String(perfilGrupo1?.moneda_base || item.moneda_base_socio1 || 'USDT').trim().toUpperCase();
-  const monBase2 = String(perfilGrupo2?.moneda_base || item.moneda_base_socio2 || 'USDT').trim().toUpperCase();
+  const monBase1 = String(perfil1?.moneda_base || 'USDT').trim().toUpperCase();
+  const monBase2 = String(perfil2?.moneda_base || 'USDT').trim().toUpperCase();
 
-  // 4. Determinar Naturaleza de Operación (A, D, P)
+  // 4. Naturaleza / Tipo de operación (A, D, P)
   let tipoCalculado = item.tipo || item.tipo_op1 || item.naturaleza;
   if (!tipoCalculado || tipoCalculado === 'D') {
     if (moneda && monBase1 && moneda === monBase1) tipoCalculado = 'A';
-    else if (perfilGrupo1?.monedas?.[moneda]?.tipo) tipoCalculado = perfilGrupo1.monedas[moneda].tipo;
+    else if (perfil1?.monedas?.[moneda]?.tipo) tipoCalculado = perfil1.monedas[moneda].tipo;
     else if (moneda !== monBase1 && moneda !== '') tipoCalculado = 'P';
     else tipoCalculado = 'D';
   }
 
-  // 5. Extracción de Tasas
+  // 5. Cálculo de Tasas
   let tasa1 = (tipoCalculado === 'A' || monBase1 === moneda) ? 1.00 : extraerTasaHub(dataHub1, moneda, tipoCalculado);
   let tasa2 = (tipoCalculado === 'A' || monBase2 === moneda) ? 1.00 : extraerTasaHub(dataHub2, moneda, tipoCalculado);
 
@@ -170,6 +166,7 @@ async function procesarComprobante(item) {
   const me1 = tasaMeBase > 0 ? Number((monto / tasaMeBase).toFixed(2)) : monto1;
   const me2 = tasaMeBase > 0 ? Number((monto / tasaMeBase).toFixed(2)) : monto2;
 
+  // JSON final con estructura unificada única
   return {
     comprobante: {
       lote,
@@ -181,22 +178,20 @@ async function procesarComprobante(item) {
       tipo: tipoCalculado,
       link_img: item.url_r2_comprobante || item.link_img || item.url_imagen || '',
       grupo_1: {
-        nombre_1: nombreGrupo1,
-        id_grupo_1: perfilGrupo1?.id_grupo || rawGrupo1,
-        tasa_1: tasa1,
-        polaridad_1: perfilGrupo1?.monedas?.[moneda]?.polaridad || '+',
-        monto_1: monto1,
-        moneda_base_1: monBase1,
-        me_1: me1
+        grupo: g1Identificador,
+        tasa: tasa1,
+        polaridad: perfil1?.monedas?.[moneda]?.polaridad || '+',
+        monto: monto1,
+        moneda_base: monBase1,
+        me: me1
       },
       grupo_2: {
-        nombre_2: nombreGrupo2,
-        id_grupo_2: perfilGrupo2?.id_grupo || rawGrupo2,
-        tasa_2: tasa2,
-        polaridad_2: perfilGrupo2?.monedas?.[moneda]?.polaridad || '+',
-        monto_2: monto2,
-        moneda_base_2: monBase2,
-        me_2: me2
+        grupo: g2Identificador,
+        tasa: tasa2,
+        polaridad: perfil2?.monedas?.[moneda]?.polaridad || '+',
+        monto: monto2,
+        moneda_base: monBase2,
+        me: me2
       }
     }
   };
