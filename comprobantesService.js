@@ -1,6 +1,6 @@
 /**
  * @file comprobantesService.js
- * Extracción corregida leyendo res.data.tarjetas_paises de TasasHub.
+ * Lógica determinista con resolución dinámica de lote por fecha de primer impacto.
  */
 
 const db = require('./db');
@@ -50,42 +50,73 @@ async function obtenerPerfilGrupo(identificador) {
   }
 }
 
-async function obtenerLoteTasasGlaukov(idLote) {
-  if (!idLote) return null;
+/**
+ * 🟢 BUSCAR LOTE DINÁMICO POR FECHA DE PRIMER IMPACTO
+ * Encuentra el lote publicado en tasas_glaukov con la fecha más próxima anterior o igual.
+ */
+async function obtenerLoteTasasPorFecha(fechaImpacto, idLoteForzado = null) {
   try {
+    // Si viene un id_tasa/lote explícito en el comprobante, intentar buscarlo directamente primero
+    if (idLoteForzado) {
+      const { rows } = await db.query(
+        'SELECT id_tasa, tasas, fecha FROM tasas_glaukov WHERE UPPER(TRIM(id_tasa)) = UPPER(TRIM($1)) LIMIT 1;',
+        [idLoteForzado]
+      );
+      if (rows[0]) {
+        const loteObj = rows[0];
+        if (typeof loteObj.tasas === 'string') {
+          try { loteObj.tasas = JSON.parse(loteObj.tasas); } catch (e) { loteObj.tasas = {}; }
+        }
+        return loteObj;
+      }
+    }
+
+    // Si no hay lote forzado o no existe, buscar por fecha <= fechaImpacto
+    const targetDate = fechaImpacto ? new Date(fechaImpacto) : new Date();
+
     const query = `
       SELECT id_tasa, tasas, fecha 
       FROM tasas_glaukov 
-      WHERE UPPER(TRIM(id_tasa)) = UPPER(TRIM($1)) 
+      WHERE fecha <= $1 
+      ORDER BY fecha DESC 
       LIMIT 1;
     `;
-    const { rows } = await db.query(query, [idLote]);
-    if (!rows[0]) return null;
+    const { rows } = await db.query(query, [targetDate]);
 
-    const loteObj = rows[0];
+    // Fallback: si el comprobante es más antiguo que cualquier registro, traer la tasa publicada más antigua disponible
+    let loteObj = rows[0];
+    if (!loteObj) {
+      const fallbackQuery = 'SELECT id_tasa, tasas, fecha FROM tasas_glaukov ORDER BY fecha ASC LIMIT 1;';
+      const fallbackRes = await db.query(fallbackQuery);
+      loteObj = fallbackRes.rows[0];
+    }
+
+    if (!loteObj) return null;
+
     if (typeof loteObj.tasas === 'string') {
       try { loteObj.tasas = JSON.parse(loteObj.tasas); } catch (e) { loteObj.tasas = {}; }
     }
     return loteObj;
+
   } catch (err) {
+    console.error(`[glaukapi ❌ Error buscando Lote por fecha ${fechaImpacto}]:`, err.message);
     return null;
   }
 }
 
-async function consultarTasasHub(nombreGrupo, lote) {
+async function consultarTasasHub(nombreGrupo, idLote) {
   if (!nombreGrupo || nombreGrupo === 'GENERAL' || nombreGrupo === 'NO DEFINIDO') return null;
   if (String(nombreGrupo).includes('@g.us')) return null;
 
   try {
     const grupoQuery = encodeURIComponent(String(nombreGrupo).trim());
-    const loteQuery = lote ? `?lote=${encodeURIComponent(String(lote).trim())}` : '';
+    const loteQuery = idLote ? `?lote=${encodeURIComponent(String(idLote).trim())}` : '';
     const url = `${TASASHUB_BASE_URL}/${grupoQuery}${loteQuery}`;
 
     const res = await fetch(url);
     if (!res.ok) return null;
     
     const json = await res.json();
-    // 🟢 Extrae directo el objeto data devuelto por TasasHub
     return json?.data || json;
   } catch (err) {
     console.warn(`[glaukapi ⚠️ TasasHub Fetch Error]:`, err.message);
@@ -93,9 +124,6 @@ async function consultarTasasHub(nombreGrupo, lote) {
   }
 }
 
-/**
- * Extrae la tasa dentro de data.tarjetas_paises
- */
 function extraerTasaHub(dataHub, moneda, naturaleza) {
   if (!dataHub || !Array.isArray(dataHub.tarjetas_paises)) return 'N/A';
 
@@ -121,30 +149,38 @@ function extraerTasaHub(dataHub, moneda, naturaleza) {
 }
 
 async function procesarComprobante(item) {
-  const lote = String(item.lote_tasa || item.lote_tasa_asignado || item.id_tasa || 'T001').trim();
   const monto = Math.abs(Number(item.monto || item.monto_local || 0));
   const moneda = String(item.moneda || item.moneda_local || '').trim().toUpperCase();
 
+  // 1. Obtener la Fecha de Primer Impacto del Comprobante
+  const fechaImpacto = item.created_at || item.fecha || item.fecha_creacion || item.timestamp || new Date();
+  const idLoteExplicit = item.lote_tasa || item.lote_tasa_asignado || item.id_tasa;
+
+  // 2. Extraer identificadores raw de grupos
   const rawGrupo1 = item.id_grupo_1 || item.grupo_raw_1 || item.nombre_socio_1 || item.socio_1 || item.grupo_1 || item.id_chat || 'GENERAL';
   const rawGrupo2 = item.id_grupo_2 || item.grupo_raw_2 || item.nombre_socio_2 || item.socio_2 || item.grupo_2 || 'GENERAL';
 
+  // 3. Resolver perfiles y obtener el Lote por la fecha más próxima anterior
   const [perfil1, perfil2, loteGlaukov] = await Promise.all([
     obtenerPerfilGrupo(rawGrupo1),
     obtenerPerfilGrupo(rawGrupo2),
-    obtenerLoteTasasGlaukov(lote)
+    obtenerLoteTasasPorFecha(fechaImpacto, idLoteExplicit)
   ]);
 
+  const loteCodigo = loteGlaukov?.id_tasa || 'T001';
   const nombreGrupo1 = perfil1?.nombre || rawGrupo1;
   const nombreGrupo2 = perfil2?.nombre || rawGrupo2;
 
+  // 4. Consultar TasasHub enviando el código de lote dinámico resuelto
   const [dataHub1, dataHub2] = await Promise.all([
-    consultarTasasHub(nombreGrupo1, lote),
-    consultarTasasHub(nombreGrupo2, lote)
+    consultarTasasHub(nombreGrupo1, loteCodigo),
+    consultarTasasHub(nombreGrupo2, loteCodigo)
   ]);
 
   const monBase1 = String(perfil1?.moneda_base || 'USDT').trim().toUpperCase();
   const monBase2 = String(perfil2?.moneda_base || 'USDT').trim().toUpperCase();
 
+  // 5. Determinar Naturaleza de la Operación (A, D, P)
   let tipoCalculado = item.tipo || item.tipo_op1 || item.naturaleza;
   if (!tipoCalculado || tipoCalculado === 'D') {
     if (moneda && monBase1 && moneda === monBase1) tipoCalculado = 'A';
@@ -153,6 +189,7 @@ async function procesarComprobante(item) {
     else tipoCalculado = 'D';
   }
 
+  // 6. Extracción de Tasas T1 / T2
   let tasa1 = (tipoCalculado === 'A' || monBase1 === moneda) ? 1.00 : extraerTasaHub(dataHub1, moneda, tipoCalculado);
   let tasa2 = (tipoCalculado === 'A' || monBase2 === moneda) ? 1.00 : extraerTasaHub(dataHub2, moneda, tipoCalculado);
 
@@ -168,7 +205,7 @@ async function procesarComprobante(item) {
 
   return {
     comprobante: {
-      lote,
+      lote: loteCodigo,
       monto,
       moneda,
       banco: item.banco || item.entidad || '',
