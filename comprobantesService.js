@@ -1,6 +1,6 @@
 /**
  * @file comprobantesService.js
- * Cruce de fecha por created_at en tasas_glaukov contra timestamp_msg de RemitHub.
+ * Extracción corregida de polaridad ligada a pago/depósito y no a la moneda en seco.
  */
 
 const db = require('./db');
@@ -23,21 +23,42 @@ function normalizarCodigoMoneda(moneda) {
 
 function parsearTimestampMsg(ts) {
   if (!ts) return new Date();
-  
-  // Si ya viene como string ISO 8601
   if (typeof ts === 'string' && ts.includes('T')) {
     const d = new Date(ts);
     if (!isNaN(d.getTime())) return d;
   }
-
   const num = Number(ts);
   if (isNaN(num) || num <= 0) return new Date();
-
-  // Si el timestamp esta en segundos Unix (10 digitos ej: 1791580715)
-  if (String(num).length === 10) {
-    return new Date(num * 1000);
-  }
+  if (String(num).length === 10) return new Date(num * 1000);
   return new Date(num);
+}
+
+/**
+ * 🟢 EXTRACCIÓN CORRECTA DE POLARIDAD SEGÚN PAGO / DEPÓSITO
+ */
+function obtenerPolaridadExacta(perfil, moneda, tipoOperacion) {
+  if (!perfil || !perfil.monedas) return '+';
+
+  const codigos = normalizarCodigoMoneda(moneda);
+  const keyMoneda = Object.keys(perfil.monedas).find(m => codigos.includes(m.toUpperCase()));
+
+  if (!keyMoneda) return '+';
+
+  const configMoneda = perfil.monedas[keyMoneda];
+  const tipo = String(tipoOperacion || configMoneda.tipo || 'P').trim().toUpperCase();
+
+  // 1. Si la polaridad está especificada explícitamente dentro del sub-objeto de porcentaje
+  if (configMoneda.porcentaje) {
+    if (tipo === 'P' && configMoneda.porcentaje.polaridad_pago) return configMoneda.porcentaje.polaridad_pago;
+    if (tipo === 'D' && configMoneda.porcentaje.polaridad_deposito) return configMoneda.porcentaje.polaridad_deposito;
+  }
+
+  // 2. Si existe un mapeo específico por tipo en la moneda
+  if (tipo === 'P' && configMoneda.polaridad_pago) return configMoneda.polaridad_pago;
+  if (tipo === 'D' && configMoneda.polaridad_deposito) return configMoneda.polaridad_deposito;
+
+  // 3. Fallback a la polaridad general de la moneda o '+' por defecto
+  return configMoneda.polaridad || '+';
 }
 
 async function obtenerPerfilGrupo(identificador) {
@@ -69,14 +90,10 @@ async function obtenerPerfilGrupo(identificador) {
   }
 }
 
-/**
- * 🟢 CRUCE EXACTO: created_at de tasas_glaukov vs timestamp_msg de RemitHub
- */
 async function obtenerLoteTasasPorFecha(timestampMsg) {
   try {
     const fechaRemitHub = parsearTimestampMsg(timestampMsg);
 
-    // Búsqueda en tasas_glaukov comparando created_at <= fechaRemitHub
     const query = `
       SELECT id_tasa, tasas, created_at 
       FROM tasas_glaukov 
@@ -85,10 +102,8 @@ async function obtenerLoteTasasPorFecha(timestampMsg) {
       LIMIT 1;
     `;
     const { rows } = await db.query(query, [fechaRemitHub]);
-
     let loteObj = rows[0];
 
-    // Fallback: Si el comprobante es más antiguo que los lotes en la base de datos, toma el lote más antiguo o el primero disponible
     if (!loteObj) {
       const fallbackRes = await db.query('SELECT id_tasa, tasas, created_at FROM tasas_glaukov ORDER BY created_at ASC LIMIT 1;');
       loteObj = fallbackRes.rows[0];
@@ -100,9 +115,8 @@ async function obtenerLoteTasasPorFecha(timestampMsg) {
       try { loteObj.tasas = JSON.parse(loteObj.tasas); } catch (e) { loteObj.tasas = {}; }
     }
     return loteObj;
-
   } catch (err) {
-    console.error(`[glaukapi ❌ Error Lote Query por created_at]:`, err.message);
+    console.error(`[glaukapi ❌ Error Lote Query]:`, err.message);
     return null;
   }
 }
@@ -159,14 +173,11 @@ async function procesarComprobante(item) {
   const monto = Math.abs(Number(item.monto || item.monto_local || 0));
   const moneda = String(item.moneda || item.moneda_local || '').trim().toUpperCase();
 
-  // 1. Timestamp de RemitHub
   const tsMsg = item.timestamp_msg || item.created_at || item.fecha;
 
-  // 2. Extraer JIDs de los grupos
   const rawGrupo1 = item.id_grupo_1 || item.grupo_raw_1 || item.nombre_socio_1 || item.socio_1 || item.grupo_1 || item.id_chat || 'GENERAL';
   const rawGrupo2 = item.id_grupo_2 || item.grupo_raw_2 || item.nombre_socio_2 || item.socio_2 || item.grupo_2 || 'GENERAL';
 
-  // 3. Resolver perfiles y lote correspondiente cruzandocreated_at
   const [perfil1, perfil2, loteGlaukov] = await Promise.all([
     obtenerPerfilGrupo(rawGrupo1),
     obtenerPerfilGrupo(rawGrupo2),
@@ -177,7 +188,6 @@ async function procesarComprobante(item) {
   const nombreGrupo1 = perfil1?.nombre || rawGrupo1;
   const nombreGrupo2 = perfil2?.nombre || rawGrupo2;
 
-  // 4. Consultar TasasHub enviando el lote dinámico (ej: "T055")
   const [dataHub1, dataHub2] = await Promise.all([
     consultarTasasHub(nombreGrupo1, loteCodigo),
     consultarTasasHub(nombreGrupo2, loteCodigo)
@@ -186,7 +196,6 @@ async function procesarComprobante(item) {
   const monBase1 = String(perfil1?.moneda_base || 'USDT').trim().toUpperCase();
   const monBase2 = String(perfil2?.moneda_base || 'USDT').trim().toUpperCase();
 
-  // 5. Naturaleza de Operación (A, D, P)
   let tipoCalculado = item.tipo || item.tipo_op1 || item.naturaleza;
   if (!tipoCalculado || tipoCalculado === 'D') {
     if (moneda && monBase1 && moneda === monBase1) tipoCalculado = 'A';
@@ -195,7 +204,6 @@ async function procesarComprobante(item) {
     else tipoCalculado = 'D';
   }
 
-  // 6. Extracción de Tasas T1 / T2
   let tasa1 = (tipoCalculado === 'A' || monBase1 === moneda) ? 1.00 : extraerTasaHub(dataHub1, moneda, tipoCalculado);
   let tasa2 = (tipoCalculado === 'A' || monBase2 === moneda) ? 1.00 : extraerTasaHub(dataHub2, moneda, tipoCalculado);
 
@@ -208,6 +216,10 @@ async function procesarComprobante(item) {
   const tasaMeBase = Number(loteGlaukov?.tasas?.[moneda] || 1);
   const me1 = tasaMeBase > 0 ? Number((monto / tasaMeBase).toFixed(2)) : monto1;
   const me2 = tasaMeBase > 0 ? Number((monto / tasaMeBase).toFixed(2)) : monto2;
+
+  // 🟢 POLARIDAD CALCULADA EVALUANDO PAGO/DEPÓSITO PARA CADA GRUPO
+  const polaridad1 = obtenerPolaridadExacta(perfil1, moneda, tipoCalculado);
+  const polaridad2 = obtenerPolaridadExacta(perfil2, moneda, tipoCalculado);
 
   return {
     comprobante: {
@@ -222,7 +234,7 @@ async function procesarComprobante(item) {
       grupo_1: {
         grupo: nombreGrupo1,
         tasa: tasa1,
-        polaridad: perfil1?.monedas?.[moneda]?.polaridad || '+',
+        polaridad: polaridad1,
         monto: monto1,
         moneda_base: monBase1,
         me: me1
@@ -230,7 +242,7 @@ async function procesarComprobante(item) {
       grupo_2: {
         grupo: nombreGrupo2,
         tasa: tasa2,
-        polaridad: perfil2?.monedas?.[moneda]?.polaridad || '+',
+        polaridad: polaridad2,
         monto: monto2,
         moneda_base: monBase2,
         me: me2
