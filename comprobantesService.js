@@ -301,15 +301,19 @@ async function procesarComprobante(item) {
     else tipoCalculado = 'D';
   }
 
-  // 4. Extracción de Tasas T1 y T2
+  // 4. Extracción de Tasas T1 y T2 (Abonos 'A' siempre fuerzan 1.0)
   let tasa1 = 'N/A';
-  if (tieneMonedaS1) {
-    tasa1 = (tipoCalculado === 'A' || monBase1 === moneda) ? 1.00 : extraerTasaHub(dataHub1, moneda, tipoCalculado);
+  if (tipoCalculado === 'A' || monBase1 === moneda) {
+    tasa1 = 1;
+  } else if (tieneMonedaS1) {
+    tasa1 = extraerTasaHub(dataHub1, moneda, tipoCalculado);
   }
 
   let tasa2 = 'N/A';
-  if (tieneMonedaS2) {
-    tasa2 = (tipoCalculado === 'A' || monBase2 === moneda) ? 1.00 : extraerTasaHub(dataHub2, moneda, tipoCalculado);
+  if (tipoCalculado === 'A' || monBase2 === moneda) {
+    tasa2 = 1;
+  } else if (tieneMonedaS2) {
+    tasa2 = extraerTasaHub(dataHub2, moneda, tipoCalculado);
   }
 
   const numT1 = Number(tasa1);
