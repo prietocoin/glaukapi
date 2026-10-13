@@ -2,6 +2,7 @@
  * @file comprobantesService.js
  * Servicio determinista de procesamiento de comprobantes para glaukapi.
  * Integra la taxonomía de 4 roles: ADMIN, ASESOR, SOCIO y PROVEEDOR.
+ * Resuelve herencia de tasas sin caídas a "N/A" y soporta paridad USD/USDT.
  */
 
 const db = require('./db');
@@ -21,7 +22,8 @@ function normalizarCodigoMoneda(moneda) {
   if (mon === 'PEN' || mon === 'SOL' || mon === 'SOLES') return ['PEN', 'SOL', 'SOLES'];
   if (mon === 'ARS' || mon === 'ARG') return ['ARS', 'ARG'];
   if (mon === 'COP') return ['COP'];
-  if (mon === 'USD' || mon === 'USDT' || mon === 'ECU') return ['USD', 'USDT', 'ECU'];
+  if (mon === 'MXN' || mon === 'MEX') return ['MXN', 'MEX'];
+  if (mon === 'USD' || mon === 'USDT' || mon === 'ECU' || mon === 'PYUSD') return ['USD', 'USDT', 'ECU', 'PYUSD'];
   return [mon];
 }
 
@@ -117,9 +119,9 @@ async function obtenerPerfilGrupo(identificador) {
       perfil.rol = 'SOCIO';
     }
 
-    // 🟢 REGLA CONTABLE POR ROL
-    // Si es ASESOR o si es un SOCIO con herencia === true, conmuta a FUNDDA
-    if (perfil.rol === 'ASESOR' || (perfil.rol === 'SOCIO' && perfil.herencia === true)) {
+    // 🟢 REGLA CONTABLE POR ROL / HERENCIA
+    // Si es ASESOR, ADMIN o si es un SOCIO con herencia === true, conmuta a la cartelera FUNDDA
+    if (perfil.rol === 'ASESOR' || perfil.rol === 'ADMIN' || perfil.herencia === true) {
       const matrizFundda = await obtenerPerfilMatrizFundda();
       perfil.grupo_tasashub = 'FUNDDA';
 
@@ -211,7 +213,7 @@ async function obtenerLoteTasasPorFecha(timestampMsg) {
 }
 
 /**
- * Realiza la consulta HTTP a TasasHub.
+ * Realiza la consulta HTTP a TasasHub de forma segura.
  */
 async function consultarTasasHub(nombreGrupo, idLote) {
   const grupoLimpio = limpiarNombreGrupo(nombreGrupo);
@@ -291,16 +293,14 @@ async function procesarComprobante(item) {
   const rol1 = perfil1?.rol || (nombreGrupo1.toUpperCase() === 'FUNDDA' ? 'ADMIN' : 'SOCIO');
   const rol2 = perfil2?.rol || (nombreGrupo2.toUpperCase() === 'FUNDDA' ? 'ADMIN' : 'SOCIO');
 
-  // 2. Verificar pool de monedas
-  const tieneMonedaS1 = socioTieneMonedaConfigurada(perfil1, moneda);
-  const tieneMonedaS2 = socioTieneMonedaConfigurada(perfil2, moneda);
+  // 🟢 SELECCIÓN DEFENSIVA DEL GRUPO A CONSULTAR EN TASASHUB
+  const targetTasas1 = perfil1?.grupo_tasashub || 'FUNDDA';
+  const targetTasas2 = perfil2?.grupo_tasashub || 'FUNDDA';
 
-  const targetTasas1 = perfil1?.grupo_tasashub || nombreGrupo1;
-  const targetTasas2 = perfil2?.grupo_tasashub || nombreGrupo2;
-
+  // 2. Consulta directa a TasasHub
   const [dataHub1, dataHub2] = await Promise.all([
-    tieneMonedaS1 ? consultarTasasHub(targetTasas1, loteCodigo) : null,
-    tieneMonedaS2 ? consultarTasasHub(targetTasas2, loteCodigo) : null
+    consultarTasasHub(targetTasas1, loteCodigo),
+    consultarTasasHub(targetTasas2, loteCodigo)
   ]);
 
   const monBase1 = String(perfil1?.moneda_base || 'USDT').trim().toUpperCase();
@@ -315,18 +315,21 @@ async function procesarComprobante(item) {
     else tipoCalculado = 'D';
   }
 
-  // 4. Extracción de Tasas T1 y T2 (Abonos 'A' fuerzan tasa 1.0)
+  // 🟢 4. EXTRACCIÓN DE TASAS T1 Y T2 (GARANTÍA DE USD/USDT Y ABONOS)
+  const esDolarS1 = ['USD', 'USDT', 'PYUSD'].includes(moneda) || monBase1 === moneda;
+  const esDolarS2 = ['USD', 'USDT', 'PYUSD'].includes(moneda) || monBase2 === moneda;
+
   let tasa1 = 'N/A';
-  if (tipoCalculado === 'A' || monBase1 === moneda) {
+  if (tipoCalculado === 'A' || esDolarS1) {
     tasa1 = 1;
-  } else if (tieneMonedaS1) {
+  } else {
     tasa1 = extraerTasaHub(dataHub1, moneda, tipoCalculado);
   }
 
   let tasa2 = 'N/A';
-  if (tipoCalculado === 'A' || monBase2 === moneda) {
+  if (tipoCalculado === 'A' || esDolarS2) {
     tasa2 = 1;
-  } else if (tieneMonedaS2) {
+  } else {
     tasa2 = extraerTasaHub(dataHub2, moneda, tipoCalculado);
   }
 
