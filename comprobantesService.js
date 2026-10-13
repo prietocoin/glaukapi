@@ -1,7 +1,7 @@
 /**
  * @file comprobantesService.js
  * Servicio determinista de procesamiento de comprobantes para glaukapi.
- * Soporta herencia estricta a FUNDDA, lectura de polar_D/polar_P y lote por timestamp_msg.
+ * Integra la taxonomía de 4 roles: ADMIN, ASESOR, SOCIO y PROVEEDOR.
  */
 
 const db = require('./db');
@@ -53,12 +53,12 @@ function parsearTimestampMsg(ts) {
 }
 
 /**
- * Obtiene el perfil matriz de FUNDDA desde PostgreSQL.
+ * Obtiene el perfil matriz de FUNDDA (Rol ADMIN) desde PostgreSQL.
  */
 async function obtenerPerfilMatrizFundda() {
   try {
     const { rows } = await db.query(`
-      SELECT id_grupo, nombre, moneda_base, monedas, herencia 
+      SELECT id_grupo, nombre, moneda_base, monedas, herencia, rol 
       FROM perfiles_glaukov 
       WHERE UPPER(TRIM(nombre)) = 'FUNDDA' 
          OR UPPER(TRIM(id_grupo)) = '120363401374720092@G.US'
@@ -67,6 +67,7 @@ async function obtenerPerfilMatrizFundda() {
     if (!rows[0]) return null;
 
     const perfil = rows[0];
+    perfil.rol = String(perfil.rol || 'ADMIN').toUpperCase().trim();
     if (typeof perfil.monedas === 'string') {
       try { perfil.monedas = JSON.parse(perfil.monedas); } catch (e) { perfil.monedas = {}; }
     }
@@ -78,7 +79,7 @@ async function obtenerPerfilMatrizFundda() {
 }
 
 /**
- * Obtiene el perfil del grupo en Postgres y resuelve la herencia si herencia === true.
+ * Obtiene el perfil del grupo en Postgres y resuelve la herencia en base a su Rol.
  */
 async function obtenerPerfilGrupo(identificador) {
   if (!identificador || identificador === 'GENERAL' || identificador === 'NO DEFINIDO') {
@@ -90,7 +91,7 @@ async function obtenerPerfilGrupo(identificador) {
     const numericPart = rawVal.split('@')[0];
 
     const query = `
-      SELECT id_grupo, nombre, moneda_base, monedas, herencia 
+      SELECT id_grupo, nombre, moneda_base, monedas, herencia, rol 
       FROM perfiles_glaukov 
       WHERE UPPER(TRIM(id_grupo)) = UPPER(TRIM($1))
          OR UPPER(TRIM(nombre)) = UPPER(TRIM($1))
@@ -106,8 +107,19 @@ async function obtenerPerfilGrupo(identificador) {
       try { perfil.monedas = JSON.parse(perfil.monedas); } catch (e) { perfil.monedas = {}; }
     }
 
-    // 🟢 REGLA DE HERENCIA BOOLEANA LIMPIA
-    if (perfil.herencia === true) {
+    // 🟢 RESOLUCIÓN DE ROL DETERMINISTA
+    const nombreUpper = String(perfil.nombre || '').toUpperCase().trim();
+    if (perfil.rol) {
+      perfil.rol = String(perfil.rol).toUpperCase().trim();
+    } else if (nombreUpper === 'FUNDDA') {
+      perfil.rol = 'ADMIN';
+    } else {
+      perfil.rol = 'SOCIO';
+    }
+
+    // 🟢 REGLA CONTABLE POR ROL
+    // Si es ASESOR o si es un SOCIO con herencia === true, conmuta a FUNDDA
+    if (perfil.rol === 'ASESOR' || (perfil.rol === 'SOCIO' && perfil.herencia === true)) {
       const matrizFundda = await obtenerPerfilMatrizFundda();
       perfil.grupo_tasashub = 'FUNDDA';
 
@@ -129,7 +141,7 @@ async function obtenerPerfilGrupo(identificador) {
 }
 
 /**
- * Verifica si un socio tiene configurada y activa la moneda en su pool.
+ * Verifica si una entidad tiene configurada y activa la moneda en su pool.
  */
 function socioTieneMonedaConfigurada(perfil, moneda) {
   if (!perfil || !perfil.monedas) return false;
@@ -264,7 +276,7 @@ async function procesarComprobante(item) {
   const rawGrupo1 = item.id_grupo_1 || item.grupo_raw_1 || item.nombre_socio_1 || item.socio_1 || item.grupo_1 || item.id_chat || 'GENERAL';
   const rawGrupo2 = item.id_grupo_2 || item.grupo_raw_2 || item.nombre_socio_2 || item.socio_2 || item.grupo_2 || 'GENERAL';
 
-  // 1. Resolver perfiles
+  // 1. Resolver perfiles (con asignación de Roles)
   const [perfil1, perfil2, loteGlaukov] = await Promise.all([
     obtenerPerfilGrupo(rawGrupo1),
     obtenerPerfilGrupo(rawGrupo2),
@@ -276,11 +288,13 @@ async function procesarComprobante(item) {
   const nombreGrupo1 = perfil1?.nombre || rawGrupo1;
   const nombreGrupo2 = perfil2?.nombre || rawGrupo2;
 
+  const rol1 = perfil1?.rol || (nombreGrupo1.toUpperCase() === 'FUNDDA' ? 'ADMIN' : 'SOCIO');
+  const rol2 = perfil2?.rol || (nombreGrupo2.toUpperCase() === 'FUNDDA' ? 'ADMIN' : 'SOCIO');
+
   // 2. Verificar pool de monedas
   const tieneMonedaS1 = socioTieneMonedaConfigurada(perfil1, moneda);
   const tieneMonedaS2 = socioTieneMonedaConfigurada(perfil2, moneda);
 
-  // Nombre objetivo para consultar en TasasHub (si herencia === true usa "FUNDDA")
   const targetTasas1 = perfil1?.grupo_tasashub || nombreGrupo1;
   const targetTasas2 = perfil2?.grupo_tasashub || nombreGrupo2;
 
@@ -301,7 +315,7 @@ async function procesarComprobante(item) {
     else tipoCalculado = 'D';
   }
 
-  // 4. Extracción de Tasas T1 y T2 (Abonos 'A' siempre fuerzan 1.0)
+  // 4. Extracción de Tasas T1 y T2 (Abonos 'A' fuerzan tasa 1.0)
   let tasa1 = 'N/A';
   if (tipoCalculado === 'A' || monBase1 === moneda) {
     tasa1 = 1;
@@ -342,6 +356,7 @@ async function procesarComprobante(item) {
       link_img: item.url_r2_comprobante || item.link_img || item.url_imagen || '',
       grupo_1: {
         grupo: nombreGrupo1,
+        rol: rol1,
         tasa: tasa1,
         polaridad: polaridad1,
         monto: monto1,
@@ -350,6 +365,7 @@ async function procesarComprobante(item) {
       },
       grupo_2: {
         grupo: nombreGrupo2,
+        rol: rol2,
         tasa: tasa2,
         polaridad: polaridad2,
         monto: monto2,
