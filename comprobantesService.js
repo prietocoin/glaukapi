@@ -2,7 +2,7 @@
  * @file comprobantesService.js
  * Servicio determinista de procesamiento de comprobantes para glaukapi.
  * Integra la taxonomía de 4 roles: ADMIN, ASESOR, SOCIO y PROVEEDOR.
- * Resuelve herencia de tasas sin caídas a "N/A" y soporta paridad USD/USDT.
+ * Resuelve herencia de tasas mapeando la estructura real de TasasHub (json.datos.tarjetas_paises).
  */
 
 const db = require('./db');
@@ -120,7 +120,6 @@ async function obtenerPerfilGrupo(identificador) {
     }
 
     // 🟢 REGLA CONTABLE POR ROL / HERENCIA
-    // Si es ASESOR, ADMIN o si es un SOCIO con herencia === true, conmuta a la cartelera FUNDDA
     if (perfil.rol === 'ASESOR' || perfil.rol === 'ADMIN' || perfil.herencia === true) {
       const matrizFundda = await obtenerPerfilMatrizFundda();
       perfil.grupo_tasashub = 'FUNDDA';
@@ -213,7 +212,7 @@ async function obtenerLoteTasasPorFecha(timestampMsg) {
 }
 
 /**
- * Realiza la consulta HTTP a TasasHub de forma segura.
+ * Realiza la consulta HTTP a TasasHub retornando el objeto completo.
  */
 async function consultarTasasHub(nombreGrupo, idLote) {
   const grupoLimpio = limpiarNombreGrupo(nombreGrupo);
@@ -228,7 +227,7 @@ async function consultarTasasHub(nombreGrupo, idLote) {
     if (!res.ok) return null;
     
     const json = await res.json();
-    return json?.data || json;
+    return json?.datos || json?.data || json;
   } catch (err) {
     console.warn(`[glaukapi ⚠️ TasasHub Fetch Error]:`, err.message);
     return null;
@@ -236,16 +235,23 @@ async function consultarTasasHub(nombreGrupo, idLote) {
 }
 
 /**
- * Extrae el valor numérico de la tasa según la naturaleza (compra para D, venta para P).
+ * Extrae el valor numérico navegando en datos.tarjetas_paises o tarjetas_paises.
  */
 function extraerTasaHub(dataHub, moneda, naturaleza) {
-  if (!dataHub || !Array.isArray(dataHub.tarjetas_paises)) return 'N/A';
+  if (!dataHub) return 'N/A';
+
+  // 🟢 Navegación defensiva sobre el JSON de TasasHub
+  const tarjetas = Array.isArray(dataHub)
+    ? dataHub
+    : (dataHub.tarjetas_paises || dataHub.datos?.tarjetas_paises || dataHub.data?.tarjetas_paises || []);
+
+  if (!Array.isArray(tarjetas) || tarjetas.length === 0) return 'N/A';
 
   const codigosAceptados = normalizarCodigoMoneda(moneda);
   const nat = String(naturaleza || '').trim().toUpperCase();
 
-  const tarjeta = dataHub.tarjetas_paises.find(t => {
-    const codeTarjeta = String(t.code || t.moneda || '').trim().toUpperCase();
+  const tarjeta = tarjetas.find(t => {
+    const codeTarjeta = String(t.code || t.moneda || t.pais || '').trim().toUpperCase();
     return codigosAceptados.includes(codeTarjeta);
   });
 
@@ -293,7 +299,7 @@ async function procesarComprobante(item) {
   const rol1 = perfil1?.rol || (nombreGrupo1.toUpperCase() === 'FUNDDA' ? 'ADMIN' : 'SOCIO');
   const rol2 = perfil2?.rol || (nombreGrupo2.toUpperCase() === 'FUNDDA' ? 'ADMIN' : 'SOCIO');
 
-  // 🟢 SELECCIÓN DEFENSIVA DEL GRUPO A CONSULTAR EN TASASHUB
+  // 🟢 GRUPO TARGET A CONSULTAR EN TASASHUB
   const targetTasas1 = perfil1?.grupo_tasashub || 'FUNDDA';
   const targetTasas2 = perfil2?.grupo_tasashub || 'FUNDDA';
 
@@ -315,7 +321,7 @@ async function procesarComprobante(item) {
     else tipoCalculado = 'D';
   }
 
-  // 🟢 4. EXTRACCIÓN DE TASAS T1 Y T2 (GARANTÍA DE USD/USDT Y ABONOS)
+  // 🟢 4. EXTRACCIÓN DE TASAS T1 Y T2
   const esDolarS1 = ['USD', 'USDT', 'PYUSD'].includes(moneda) || monBase1 === moneda;
   const esDolarS2 = ['USD', 'USDT', 'PYUSD'].includes(moneda) || monBase2 === moneda;
 
