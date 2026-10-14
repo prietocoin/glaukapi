@@ -289,8 +289,9 @@ function extraerTasaHub(dataHub, moneda, naturaleza) {
  */
 async function guardarEnComprobantesFinal(resultado) {
   try {
-    const numT1 = isNaN(parseFloat(resultado.tasa_1)) ? 1.0 : parseFloat(resultado.tasa_1);
-    const numT2 = isNaN(parseFloat(resultado.tasa_2)) ? 1.0 : parseFloat(resultado.tasa_2);
+    // Si la tasa viene como 'N/A' o no es un número válido, se asigna 0 directamente.
+    const numT1 = (resultado.tasa_1 === 'N/A' || isNaN(resultado.tasa_1)) ? 0 : Number(resultado.tasa_1);
+    const numT2 = (resultado.tasa_2 === 'N/A' || isNaN(resultado.tasa_2)) ? 0 : Number(resultado.tasa_2);
 
     const query = `
       INSERT INTO comprobantes_final (
