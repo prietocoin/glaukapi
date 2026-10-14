@@ -3,6 +3,7 @@
  * Servicio determinista de procesamiento de comprobantes v2 para glaukapi.
  * Integra la taxonomía de 4 roles: ADMIN, ASESOR, SOCIO y PROVEEDOR.
  * Resuelve herencia de tasas y entrega un JSON estandarizado ajustado a Zona Horaria America/Caracas.
+ * Persiste automáticamente en la tabla comprobantes_final.
  */
 
 const db = require('./db');
@@ -284,6 +285,118 @@ function extraerTasaHub(dataHub, moneda, naturaleza) {
 }
 
 /**
+ * Persiste el resultado procesado en la tabla comprobantes_final.
+ */
+async function guardarEnComprobantesFinal(resultado) {
+  try {
+    const numT1 = isNaN(parseFloat(resultado.tasa_1)) ? 1.0 : parseFloat(resultado.tasa_1);
+    const numT2 = isNaN(parseFloat(resultado.tasa_2)) ? 1.0 : parseFloat(resultado.tasa_2);
+
+    const query = `
+      INSERT INTO comprobantes_final (
+        id, hash_largo, hash_corto,
+        timestamp_msg, fecha_hora_iso, fecha_fmt, hora_fmt, dia_hora_humano,
+        monto, moneda, banco, titular, referencia, tipo, tipo_manual,
+        lote, lote_tasa_asignado, es_x2, link_img, url_r2_comprobante,
+        nombre_socio_1, socio_1, rol_1, tasa_1, m1_socio, monto_1, me1, moneda_base_socio1, polaridad_1,
+        nombre_socio_2, socio_2, rol_2, tasa_2, m2_socio, monto_2, me2, moneda_base_socio2, polaridad_2,
+        grupo_1, grupo_2, updated_at
+      ) VALUES (
+        $1, $2, $3,
+        $4, $5, $6, $7, $8,
+        $9, $10, $11, $12, $13, $14, $15,
+        $16, $17, $18, $19, $20,
+        $21, $22, $23, $24, $25, $26, $27, $28, $29,
+        $30, $31, $32, $33, $34, $35, $36, $37, $38,
+        $39, $40, CURRENT_TIMESTAMP
+      )
+      ON CONFLICT (hash_largo) 
+      DO UPDATE SET
+        monto = EXCLUDED.monto,
+        moneda = EXCLUDED.moneda,
+        banco = EXCLUDED.banco,
+        titular = EXCLUDED.titular,
+        referencia = EXCLUDED.referencia,
+        tipo = EXCLUDED.tipo,
+        tipo_manual = EXCLUDED.tipo_manual,
+        lote = EXCLUDED.lote,
+        lote_tasa_asignado = EXCLUDED.lote_tasa_asignado,
+        es_x2 = EXCLUDED.es_x2,
+        link_img = COALESCE(EXCLUDED.link_img, comprobantes_final.link_img),
+        url_r2_comprobante = COALESCE(EXCLUDED.url_r2_comprobante, comprobantes_final.url_r2_comprobante),
+        nombre_socio_1 = EXCLUDED.nombre_socio_1,
+        socio_1 = EXCLUDED.socio_1,
+        rol_1 = EXCLUDED.rol_1,
+        tasa_1 = EXCLUDED.tasa_1,
+        m1_socio = EXCLUDED.m1_socio,
+        monto_1 = EXCLUDED.monto_1,
+        me1 = EXCLUDED.me1,
+        moneda_base_socio1 = EXCLUDED.moneda_base_socio1,
+        polaridad_1 = EXCLUDED.polaridad_1,
+        nombre_socio_2 = EXCLUDED.nombre_socio_2,
+        socio_2 = EXCLUDED.socio_2,
+        rol_2 = EXCLUDED.rol_2,
+        tasa_2 = EXCLUDED.tasa_2,
+        m2_socio = EXCLUDED.m2_socio,
+        monto_2 = EXCLUDED.monto_2,
+        me2 = EXCLUDED.me2,
+        moneda_base_socio2 = EXCLUDED.moneda_base_socio2,
+        polaridad_2 = EXCLUDED.polaridad_2,
+        grupo_1 = EXCLUDED.grupo_1,
+        grupo_2 = EXCLUDED.grupo_2,
+        updated_at = CURRENT_TIMESTAMP;
+    `;
+
+    const values = [
+      resultado.id,
+      resultado.hash_largo,
+      resultado.hash_corto,
+      resultado.timestamp_msg,
+      resultado.fecha_hora_iso,
+      resultado.fecha_fmt,
+      resultado.hora_fmt,
+      resultado.dia_hora_humano,
+      resultado.monto,
+      resultado.moneda,
+      resultado.banco,
+      resultado.titular,
+      resultado.referencia,
+      resultado.tipo,
+      resultado.tipo_manual,
+      resultado.lote,
+      resultado.lote_tasa_asignado,
+      resultado.es_x2,
+      resultado.link_img,
+      resultado.url_r2_comprobante,
+      resultado.nombre_socio_1,
+      resultado.socio_1,
+      resultado.rol_1,
+      numT1,
+      resultado.m1_socio,
+      resultado.monto_1,
+      resultado.me1,
+      resultado.moneda_base_socio1,
+      resultado.grupo_1?.polaridad || '+',
+      resultado.nombre_socio_2,
+      resultado.socio_2,
+      resultado.rol_2,
+      numT2,
+      resultado.m2_socio,
+      resultado.monto_2,
+      resultado.me2,
+      resultado.moneda_base_socio2,
+      resultado.grupo_2?.polaridad || '-',
+      JSON.stringify(resultado.grupo_1 || {}),
+      JSON.stringify(resultado.grupo_2 || {})
+    ];
+
+    await db.query(query, values);
+  } catch (err) {
+    console.error(`[glaukapi ❌ Error al guardar en comprobantes_final]:`, err.message);
+  }
+}
+
+/**
  * 🟢 FUNCIÓN PRINCIPAL EXPORTADA
  */
 async function procesarComprobante(item) {
@@ -361,7 +474,7 @@ async function procesarComprobante(item) {
   const s2Upper = String(nombreGrupo2).toUpperCase().trim();
   const esX2 = Boolean(s2Upper && s2Upper !== 'GENERAL' && s2Upper !== 'NO DEFINIDO');
 
-  return {
+  const resultado = {
     id: hashLargo,
     hash_largo: hashLargo,
     hash_corto: hashCorto,
@@ -423,6 +536,11 @@ async function procesarComprobante(item) {
       me: me2
     }
   };
+
+  // Guardar/Actualizar automáticamente en comprobantes_final
+  await guardarEnComprobantesFinal(resultado);
+
+  return resultado;
 }
 
 module.exports = { procesarComprobante };
