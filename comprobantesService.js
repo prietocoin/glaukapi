@@ -2,7 +2,7 @@
  * @file comprobantesService.js
  * Servicio determinista de procesamiento de comprobantes v2 para glaukapi.
  * Integra la taxonomía de 4 roles: ADMIN, ASESOR, SOCIO y PROVEEDOR.
- * Resuelve herencia de tasas y entrega un JSON estandarizado con fechas formateadas e IDs unificados.
+ * Resuelve herencia de tasas y entrega un JSON estandarizado ajustado a Zona Horaria America/Caracas.
  */
 
 const db = require('./db');
@@ -40,7 +40,7 @@ function limpiarNombreGrupo(nombre) {
 }
 
 /**
- * 🟢 PARSEADOR Y FORMATEADOR DETERMINISTA DE FECHA Y HORA (Formato v2)
+ * 🟢 PARSEADOR Y FORMATEADOR DETERMINISTA DE FECHA Y HORA (Zona Horaria Venezuela America/Caracas UTC-4)
  */
 function procesarFechaContable(ts) {
   let dateObj = new Date();
@@ -52,7 +52,6 @@ function procesarFechaContable(ts) {
     } else {
       const num = Number(ts);
       if (!isNaN(num) && num > 0) {
-        // Unix Timestamp de 10 dígitos (segundos) -> Convertir a milisegundos
         const ms = String(num).length === 10 ? num * 1000 : num;
         const d = new Date(ms);
         if (!isNaN(d.getTime())) dateObj = d;
@@ -63,24 +62,24 @@ function procesarFechaContable(ts) {
     }
   }
 
-  // Generar formatos locales estandarizados
-  const dias = ['Domingo', 'Lunes', 'Martes', 'Miércoles', 'Jueves', 'Viernes', 'Sábado'];
-  const diaNombre = dias[dateObj.getDay()];
+  const timeZone = 'America/Caracas';
 
-  let horas = dateObj.getHours();
-  const minutos = String(dateObj.getMinutes()).padStart(2, '0');
-  const ampm = horas >= 12 ? 'PM' : 'AM';
-  horas = horas % 12 || 12;
+  const fmtFecha = new Intl.DateTimeFormat('en-CA', { timeZone, year: 'numeric', month: '2-digit', day: '2-digit' });
+  const fmtHora24 = new Intl.DateTimeFormat('es-VE', { timeZone, hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
+  const fmtHumano = new Intl.DateTimeFormat('es-VE', { timeZone, weekday: 'long', hour: '2-digit', minute: '2-digit', hour12: true });
 
-  const tzOffset = dateObj.getTimezoneOffset() * 60000;
-  const localIso = new Date(dateObj.getTime() - tzOffset).toISOString();
+  const fechaFmt = fmtFecha.format(dateObj);
+  const horaFmt = fmtHora24.format(dateObj);
+
+  const diaHoraRaw = fmtHumano.format(dateObj);
+  const diaHoraHumano = diaHoraRaw.charAt(0).toUpperCase() + diaHoraRaw.slice(1);
 
   return {
     dateObj,
     iso: dateObj.toISOString(),
-    fecha_fmt: localIso.slice(0, 10), // YYYY-MM-DD
-    hora_fmt: localIso.slice(11, 19), // HH:MM:SS
-    dia_hora_humano: `${diaNombre} ${String(horas).padStart(2, '0')}:${minutos} ${ampm}`
+    fecha_fmt: fechaFmt,
+    hora_fmt: horaFmt,
+    dia_hora_humano: diaHoraHumano
   };
 }
 
@@ -139,7 +138,6 @@ async function obtenerPerfilGrupo(identificador) {
       try { perfil.monedas = JSON.parse(perfil.monedas); } catch (e) { perfil.monedas = {}; }
     }
 
-    // RESOLUCIÓN DE ROL DETERMINISTA
     const nombreUpper = String(perfil.nombre || '').toUpperCase().trim();
     if (perfil.rol) {
       perfil.rol = String(perfil.rol).toUpperCase().trim();
@@ -149,7 +147,6 @@ async function obtenerPerfilGrupo(identificador) {
       perfil.rol = 'SOCIO';
     }
 
-    // REGLA CONTABLE POR ROL / HERENCIA
     if (perfil.rol === 'ASESOR' || perfil.rol === 'ADMIN' || perfil.herencia === true) {
       const matrizFundda = await obtenerPerfilMatrizFundda();
       perfil.grupo_tasashub = 'FUNDDA';
@@ -287,10 +284,9 @@ function extraerTasaHub(dataHub, moneda, naturaleza) {
 }
 
 /**
- * 🟢 FUNCIÓN PRINCIPAL EXPORTADA CON RESPUESTA CONTRATO V2 ESTÁNDAR
+ * 🟢 FUNCIÓN PRINCIPAL EXPORTADA
  */
 async function procesarComprobante(item) {
-  // 1. Identificador de clave primaria único y sanitizado
   const hashLargo = String(
     item.hash_largo || 
     item.id || 
@@ -304,14 +300,12 @@ async function procesarComprobante(item) {
   const monto = Math.abs(Number(item.monto || item.monto_local || 0));
   const moneda = String(item.moneda || item.moneda_local || 'USDT').trim().toUpperCase();
 
-  // 2. Procesar marcas de tiempo
   const rawTs = item.timestamp_msg || item.created_at || item.fecha_hora_comprobante || item.fecha;
   const fechaObj = procesarFechaContable(rawTs);
 
   const rawGrupo1 = item.id_grupo_1 || item.grupo_raw_1 || item.nombre_socio_1 || item.socio_1 || item.grupo_1 || item.id_chat || 'GENERAL';
   const rawGrupo2 = item.id_grupo_2 || item.grupo_raw_2 || item.nombre_socio_2 || item.socio_2 || item.grupo_2 || 'GENERAL';
 
-  // 3. Resolver perfiles y lote de tasas por fecha
   const [perfil1, perfil2, loteGlaukov] = await Promise.all([
     obtenerPerfilGrupo(rawGrupo1),
     obtenerPerfilGrupo(rawGrupo2),
@@ -329,7 +323,6 @@ async function procesarComprobante(item) {
   const targetTasas1 = perfil1?.grupo_tasashub || 'FUNDDA';
   const targetTasas2 = perfil2?.grupo_tasashub || 'FUNDDA';
 
-  // 4. Consulta paralela a TasasHub
   const [dataHub1, dataHub2] = await Promise.all([
     consultarTasasHub(targetTasas1, loteCodigo),
     consultarTasasHub(targetTasas2, loteCodigo)
@@ -338,7 +331,6 @@ async function procesarComprobante(item) {
   const monBase1 = String(perfil1?.moneda_base || 'USDT').trim().toUpperCase();
   const monBase2 = String(perfil2?.moneda_base || 'USDT').trim().toUpperCase();
 
-  // 5. Determinar Naturaleza de la Operación (A, D, P)
   let tipoCalculado = item.tipo || item.tipo_op1 || item.naturaleza;
   if (!tipoCalculado || tipoCalculado === 'D') {
     if (moneda && monBase1 && moneda === monBase1) tipoCalculado = 'A';
@@ -347,7 +339,6 @@ async function procesarComprobante(item) {
     else tipoCalculado = 'D';
   }
 
-  // 6. Extracción de Tasas T1 y T2
   const esDolarS1 = ['USD', 'USDT', 'PYUSD'].includes(moneda) || monBase1 === moneda;
   const esDolarS2 = ['USD', 'USDT', 'PYUSD'].includes(moneda) || monBase2 === moneda;
 
@@ -370,7 +361,6 @@ async function procesarComprobante(item) {
   const s2Upper = String(nombreGrupo2).toUpperCase().trim();
   const esX2 = Boolean(s2Upper && s2Upper !== 'GENERAL' && s2Upper !== 'NO DEFINIDO');
 
-  // 🟢 RETORNO CONTRATO V2 COMPATIBLE CON API Y FRONTEND
   return {
     id: hashLargo,
     hash_largo: hashLargo,
@@ -396,7 +386,6 @@ async function procesarComprobante(item) {
     lote: loteCodigo,
     lote_tasa_asignado: loteCodigo,
 
-    // Compatibilidad anidada y plana
     nombre_socio_1: nombreGrupo1,
     socio_1: nombreGrupo1,
     rol_1: rol1,
