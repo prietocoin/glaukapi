@@ -1,8 +1,8 @@
 /**
  * @file comprobantesService.js
- * Servicio determinista de procesamiento de comprobantes para glaukapi.
+ * Servicio determinista de procesamiento de comprobantes v2 para glaukapi.
  * Integra la taxonomía de 4 roles: ADMIN, ASESOR, SOCIO y PROVEEDOR.
- * Resuelve herencia de tasas mapeando la estructura real de TasasHub (json.datos.tarjetas_paises).
+ * Resuelve herencia de tasas y entrega un JSON estandarizado con fechas formateadas e IDs unificados.
  */
 
 const db = require('./db');
@@ -40,18 +40,48 @@ function limpiarNombreGrupo(nombre) {
 }
 
 /**
- * Parsea el timestamp_msg de RemitHub a objeto Date de JavaScript.
+ * 🟢 PARSEADOR Y FORMATEADOR DETERMINISTA DE FECHA Y HORA (Formato v2)
  */
-function parsearTimestampMsg(ts) {
-  if (!ts) return new Date();
-  if (typeof ts === 'string' && ts.includes('T')) {
-    const d = new Date(ts);
-    if (!isNaN(d.getTime())) return d;
+function procesarFechaContable(ts) {
+  let dateObj = new Date();
+
+  if (ts) {
+    if (typeof ts === 'string' && ts.includes('T')) {
+      const d = new Date(ts);
+      if (!isNaN(d.getTime())) dateObj = d;
+    } else {
+      const num = Number(ts);
+      if (!isNaN(num) && num > 0) {
+        // Unix Timestamp de 10 dígitos (segundos) -> Convertir a milisegundos
+        const ms = String(num).length === 10 ? num * 1000 : num;
+        const d = new Date(ms);
+        if (!isNaN(d.getTime())) dateObj = d;
+      } else if (typeof ts === 'string' && ts.trim() !== '') {
+        const d = new Date(ts);
+        if (!isNaN(d.getTime())) dateObj = d;
+      }
+    }
   }
-  const num = Number(ts);
-  if (isNaN(num) || num <= 0) return new Date();
-  if (String(num).length === 10) return new Date(num * 1000);
-  return new Date(num);
+
+  // Generar formatos locales estandarizados
+  const dias = ['Domingo', 'Lunes', 'Martes', 'Miércoles', 'Jueves', 'Viernes', 'Sábado'];
+  const diaNombre = dias[dateObj.getDay()];
+
+  let horas = dateObj.getHours();
+  const minutos = String(dateObj.getMinutes()).padStart(2, '0');
+  const ampm = horas >= 12 ? 'PM' : 'AM';
+  horas = horas % 12 || 12;
+
+  const tzOffset = dateObj.getTimezoneOffset() * 60000;
+  const localIso = new Date(dateObj.getTime() - tzOffset).toISOString();
+
+  return {
+    dateObj,
+    iso: dateObj.toISOString(),
+    fecha_fmt: localIso.slice(0, 10), // YYYY-MM-DD
+    hora_fmt: localIso.slice(11, 19), // HH:MM:SS
+    dia_hora_humano: `${diaNombre} ${String(horas).padStart(2, '0')}:${minutos} ${ampm}`
+  };
 }
 
 /**
@@ -109,7 +139,7 @@ async function obtenerPerfilGrupo(identificador) {
       try { perfil.monedas = JSON.parse(perfil.monedas); } catch (e) { perfil.monedas = {}; }
     }
 
-    // 🟢 RESOLUCIÓN DE ROL DETERMINISTA
+    // RESOLUCIÓN DE ROL DETERMINISTA
     const nombreUpper = String(perfil.nombre || '').toUpperCase().trim();
     if (perfil.rol) {
       perfil.rol = String(perfil.rol).toUpperCase().trim();
@@ -119,7 +149,7 @@ async function obtenerPerfilGrupo(identificador) {
       perfil.rol = 'SOCIO';
     }
 
-    // 🟢 REGLA CONTABLE POR ROL / HERENCIA
+    // REGLA CONTABLE POR ROL / HERENCIA
     if (perfil.rol === 'ASESOR' || perfil.rol === 'ADMIN' || perfil.herencia === true) {
       const matrizFundda = await obtenerPerfilMatrizFundda();
       perfil.grupo_tasashub = 'FUNDDA';
@@ -139,19 +169,6 @@ async function obtenerPerfilGrupo(identificador) {
     console.error(`[glaukapi ❌ Error DB Perfiles]:`, err.message);
     return null;
   }
-}
-
-/**
- * Verifica si una entidad tiene configurada y activa la moneda en su pool.
- */
-function socioTieneMonedaConfigurada(perfil, moneda) {
-  if (!perfil || !perfil.monedas) return false;
-  const codigos = normalizarCodigoMoneda(moneda);
-  const keyMoneda = Object.keys(perfil.monedas).find(m => codigos.includes(m.toUpperCase()));
-  if (!keyMoneda) return false;
-
-  const config = perfil.monedas[keyMoneda];
-  return config && config.activo !== false;
 }
 
 /**
@@ -180,10 +197,8 @@ function obtenerPolaridadPorTipo(perfil, moneda, tipoCalculado, esSocio1 = true)
 /**
  * Busca en tasas_glaukov el lote publicado con created_at <= timestamp_msg.
  */
-async function obtenerLoteTasasPorFecha(timestampMsg) {
+async function obtenerLoteTasasPorFecha(dateObj) {
   try {
-    const fechaRemitHub = parsearTimestampMsg(timestampMsg);
-
     const query = `
       SELECT id_tasa, tasas, created_at 
       FROM tasas_glaukov 
@@ -191,7 +206,7 @@ async function obtenerLoteTasasPorFecha(timestampMsg) {
       ORDER BY created_at DESC 
       LIMIT 1;
     `;
-    const { rows } = await db.query(query, [fechaRemitHub]);
+    const { rows } = await db.query(query, [dateObj]);
     let loteObj = rows[0];
 
     if (!loteObj) {
@@ -235,12 +250,11 @@ async function consultarTasasHub(nombreGrupo, idLote) {
 }
 
 /**
- * Extrae el valor numérico navegando en datos.tarjetas_paises o tarjetas_paises.
+ * Extrae el valor numérico navegando en datos.tarjetas_paises.
  */
 function extraerTasaHub(dataHub, moneda, naturaleza) {
   if (!dataHub) return 'N/A';
 
-  // 🟢 Navegación defensiva sobre el JSON de TasasHub
   const tarjetas = Array.isArray(dataHub)
     ? dataHub
     : (dataHub.tarjetas_paises || dataHub.datos?.tarjetas_paises || dataHub.data?.tarjetas_paises || []);
@@ -273,22 +287,35 @@ function extraerTasaHub(dataHub, moneda, naturaleza) {
 }
 
 /**
- * Función principal exportada para procesar un comprobante.
+ * 🟢 FUNCIÓN PRINCIPAL EXPORTADA CON RESPUESTA CONTRATO V2 ESTÁNDAR
  */
 async function procesarComprobante(item) {
-  const monto = Math.abs(Number(item.monto || item.monto_local || 0));
-  const moneda = String(item.moneda || item.moneda_local || '').trim().toUpperCase();
+  // 1. Identificador de clave primaria único y sanitizado
+  const hashLargo = String(
+    item.hash_largo || 
+    item.id || 
+    item._id || 
+    item.referencia || 
+    item.ref || ''
+  ).trim();
 
-  const tsMsg = item.timestamp_msg || item.created_at || item.fecha;
+  const hashCorto = item.hash_corto || (hashLargo ? hashLargo.slice(0, 8).toUpperCase() : 'HASH');
+
+  const monto = Math.abs(Number(item.monto || item.monto_local || 0));
+  const moneda = String(item.moneda || item.moneda_local || 'USDT').trim().toUpperCase();
+
+  // 2. Procesar marcas de tiempo
+  const rawTs = item.timestamp_msg || item.created_at || item.fecha_hora_comprobante || item.fecha;
+  const fechaObj = procesarFechaContable(rawTs);
 
   const rawGrupo1 = item.id_grupo_1 || item.grupo_raw_1 || item.nombre_socio_1 || item.socio_1 || item.grupo_1 || item.id_chat || 'GENERAL';
   const rawGrupo2 = item.id_grupo_2 || item.grupo_raw_2 || item.nombre_socio_2 || item.socio_2 || item.grupo_2 || 'GENERAL';
 
-  // 1. Resolver perfiles (con asignación de Roles)
+  // 3. Resolver perfiles y lote de tasas por fecha
   const [perfil1, perfil2, loteGlaukov] = await Promise.all([
     obtenerPerfilGrupo(rawGrupo1),
     obtenerPerfilGrupo(rawGrupo2),
-    obtenerLoteTasasPorFecha(tsMsg)
+    obtenerLoteTasasPorFecha(fechaObj.dateObj)
   ]);
 
   const loteCodigo = loteGlaukov?.id_tasa || 'T001';
@@ -296,14 +323,13 @@ async function procesarComprobante(item) {
   const nombreGrupo1 = perfil1?.nombre || rawGrupo1;
   const nombreGrupo2 = perfil2?.nombre || rawGrupo2;
 
-  const rol1 = perfil1?.rol || (nombreGrupo1.toUpperCase() === 'FUNDDA' ? 'ADMIN' : 'SOCIO');
-  const rol2 = perfil2?.rol || (nombreGrupo2.toUpperCase() === 'FUNDDA' ? 'ADMIN' : 'SOCIO');
+  const rol1 = perfil1?.rol || (String(nombreGrupo1).toUpperCase() === 'FUNDDA' ? 'ADMIN' : 'SOCIO');
+  const rol2 = perfil2?.rol || (String(nombreGrupo2).toUpperCase() === 'FUNDDA' ? 'ADMIN' : 'SOCIO');
 
-  // 🟢 GRUPO TARGET A CONSULTAR EN TASASHUB
   const targetTasas1 = perfil1?.grupo_tasashub || 'FUNDDA';
   const targetTasas2 = perfil2?.grupo_tasashub || 'FUNDDA';
 
-  // 2. Consulta directa a TasasHub
+  // 4. Consulta paralela a TasasHub
   const [dataHub1, dataHub2] = await Promise.all([
     consultarTasasHub(targetTasas1, loteCodigo),
     consultarTasasHub(targetTasas2, loteCodigo)
@@ -312,7 +338,7 @@ async function procesarComprobante(item) {
   const monBase1 = String(perfil1?.moneda_base || 'USDT').trim().toUpperCase();
   const monBase2 = String(perfil2?.moneda_base || 'USDT').trim().toUpperCase();
 
-  // 3. Determinar Naturaleza de la Operación (A, D, P)
+  // 5. Determinar Naturaleza de la Operación (A, D, P)
   let tipoCalculado = item.tipo || item.tipo_op1 || item.naturaleza;
   if (!tipoCalculado || tipoCalculado === 'D') {
     if (moneda && monBase1 && moneda === monBase1) tipoCalculado = 'A';
@@ -321,23 +347,12 @@ async function procesarComprobante(item) {
     else tipoCalculado = 'D';
   }
 
-  // 🟢 4. EXTRACCIÓN DE TASAS T1 Y T2
+  // 6. Extracción de Tasas T1 y T2
   const esDolarS1 = ['USD', 'USDT', 'PYUSD'].includes(moneda) || monBase1 === moneda;
   const esDolarS2 = ['USD', 'USDT', 'PYUSD'].includes(moneda) || monBase2 === moneda;
 
-  let tasa1 = 'N/A';
-  if (tipoCalculado === 'A' || esDolarS1) {
-    tasa1 = 1;
-  } else {
-    tasa1 = extraerTasaHub(dataHub1, moneda, tipoCalculado);
-  }
-
-  let tasa2 = 'N/A';
-  if (tipoCalculado === 'A' || esDolarS2) {
-    tasa2 = 1;
-  } else {
-    tasa2 = extraerTasaHub(dataHub2, moneda, tipoCalculado);
-  }
+  let tasa1 = (tipoCalculado === 'A' || esDolarS1) ? 1 : extraerTasaHub(dataHub1, moneda, tipoCalculado);
+  let tasa2 = (tipoCalculado === 'A' || esDolarS2) ? 1 : extraerTasaHub(dataHub2, moneda, tipoCalculado);
 
   const numT1 = Number(tasa1);
   const numT2 = Number(tasa2);
@@ -349,38 +364,74 @@ async function procesarComprobante(item) {
   const me1 = tasaMeBase > 0 ? Number((monto / tasaMeBase).toFixed(2)) : monto1;
   const me2 = tasaMeBase > 0 ? Number((monto / tasaMeBase).toFixed(2)) : monto2;
 
-  // 5. Polaridades
   const polaridad1 = obtenerPolaridadPorTipo(perfil1, moneda, tipoCalculado, true);
   const polaridad2 = obtenerPolaridadPorTipo(perfil2, moneda, tipoCalculado, false);
 
+  const s2Upper = String(nombreGrupo2).toUpperCase().trim();
+  const esX2 = Boolean(s2Upper && s2Upper !== 'GENERAL' && s2Upper !== 'NO DEFINIDO');
+
+  // 🟢 RETORNO CONTRATO V2 COMPATIBLE CON API Y FRONTEND
   return {
-    comprobante: {
-      lote: loteCodigo,
-      monto,
-      moneda,
-      banco: item.banco || item.entidad || '',
-      titular: item.titular || item.nombre_titular || '',
-      referencia: item.referencia || item.ref || '',
-      tipo: tipoCalculado,
-      link_img: item.url_r2_comprobante || item.link_img || item.url_imagen || '',
-      grupo_1: {
-        grupo: nombreGrupo1,
-        rol: rol1,
-        tasa: tasa1,
-        polaridad: polaridad1,
-        monto: monto1,
-        moneda_base: monBase1,
-        me: me1
-      },
-      grupo_2: {
-        grupo: nombreGrupo2,
-        rol: rol2,
-        tasa: tasa2,
-        polaridad: polaridad2,
-        monto: monto2,
-        moneda_base: monBase2,
-        me: me2
-      }
+    id: hashLargo,
+    hash_largo: hashLargo,
+    hash_corto: hashCorto,
+
+    timestamp_msg: rawTs,
+    fecha_hora_iso: fechaObj.iso,
+    fecha_fmt: fechaObj.fecha_fmt,
+    hora_fmt: fechaObj.hora_fmt,
+    dia_hora_humano: fechaObj.dia_hora_humano,
+
+    monto,
+    moneda,
+    banco: item.banco || item.entidad || 'BANCO',
+    titular: item.titular || item.nombre_titular || 'TITULAR NO DEFINIDO',
+    referencia: item.referencia || item.ref || 'N/A',
+    tipo: tipoCalculado,
+    tipo_manual: tipoCalculado,
+    link_img: item.url_r2_comprobante || item.link_img || item.url_imagen || '',
+    url_r2_comprobante: item.url_r2_comprobante || item.link_img || item.url_imagen || '',
+
+    es_x2: esX2,
+    lote: loteCodigo,
+    lote_tasa_asignado: loteCodigo,
+
+    // Compatibilidad anidada y plana
+    nombre_socio_1: nombreGrupo1,
+    socio_1: nombreGrupo1,
+    rol_1: rol1,
+    tasa_1: tasa1,
+    m1_socio: monto1,
+    monto_1: monto1,
+    me1,
+    moneda_base_socio1: monBase1,
+
+    nombre_socio_2: nombreGrupo2,
+    socio_2: nombreGrupo2,
+    rol_2: rol2,
+    tasa_2: tasa2,
+    m2_socio: monto2,
+    monto_2: monto2,
+    me2,
+    moneda_base_socio2: monBase2,
+
+    grupo_1: {
+      grupo: nombreGrupo1,
+      rol: rol1,
+      tasa: tasa1,
+      polaridad: polaridad1,
+      monto: monto1,
+      moneda_base: monBase1,
+      me: me1
+    },
+    grupo_2: {
+      grupo: nombreGrupo2,
+      rol: rol2,
+      tasa: tasa2,
+      polaridad: polaridad2,
+      monto: monto2,
+      moneda_base: monBase2,
+      me: me2
     }
   };
 }
