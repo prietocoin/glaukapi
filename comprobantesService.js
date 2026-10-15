@@ -3,7 +3,7 @@
  * Servicio determinista de procesamiento de comprobantes v2 para glaukapi.
  * Integra la taxonomía de 4 roles: ADMIN, ASESOR, SOCIO y PROVEEDOR.
  * Resuelve herencia de tasas y entrega un JSON estandarizado ajustado a Zona Horaria America/Caracas.
- * Persiste automáticamente en la tabla comprobantes_final.
+ * Persiste ÚNICAMENTE operaciones 2x cerradas en comprobantes_final.
  */
 
 const db = require('./db');
@@ -41,7 +41,7 @@ function limpiarNombreGrupo(nombre) {
 }
 
 /**
- * 🟢 PARSEADOR Y FORMATEADOR DETERMINISTA DE FECHA Y HORA (Zona Horaria Venezuela America/Caracas UTC-4)
+ * Formateador de fecha/hora en Zona Horaria America/Caracas (UTC-4)
  */
 function procesarFechaContable(ts) {
   let dateObj = new Date();
@@ -111,7 +111,7 @@ async function obtenerPerfilMatrizFundda() {
 }
 
 /**
- * Obtiene el perfil del grupo en Postgres y resuelve la herencia en base a su Rol.
+ * Obtiene el perfil del grupo en Postgres y resuelve herencia de tasas.
  */
 async function obtenerPerfilGrupo(identificador) {
   if (!identificador || identificador === 'GENERAL' || identificador === 'NO DEFINIDO') {
@@ -170,7 +170,7 @@ async function obtenerPerfilGrupo(identificador) {
 }
 
 /**
- * Determina la polaridad exacta (+ / -) leyendo polar_D o polar_P.
+ * Determina polaridad (+ / -) según tipo de operación.
  */
 function obtenerPolaridadPorTipo(perfil, moneda, tipoCalculado, esSocio1 = true) {
   if (tipoCalculado === 'A') return esSocio1 ? '+' : '-';
@@ -193,7 +193,7 @@ function obtenerPolaridadPorTipo(perfil, moneda, tipoCalculado, esSocio1 = true)
 }
 
 /**
- * Busca en tasas_glaukov el lote publicado con created_at <= timestamp_msg.
+ * Busca lote de tasas publicado a la fecha del comprobante.
  */
 async function obtenerLoteTasasPorFecha(dateObj) {
   try {
@@ -225,7 +225,7 @@ async function obtenerLoteTasasPorFecha(dateObj) {
 }
 
 /**
- * Realiza la consulta HTTP a TasasHub retornando el objeto completo.
+ * Consulta API externa TasasHub.
  */
 async function consultarTasasHub(nombreGrupo, idLote) {
   const grupoLimpio = limpiarNombreGrupo(nombreGrupo);
@@ -248,7 +248,7 @@ async function consultarTasasHub(nombreGrupo, idLote) {
 }
 
 /**
- * Extrae el valor numérico navegando en datos.tarjetas_paises.
+ * Extrae tasa numérica de tarjetas_paises.
  */
 function extraerTasaHub(dataHub, moneda, naturaleza) {
   if (!dataHub) return 'N/A';
@@ -285,11 +285,10 @@ function extraerTasaHub(dataHub, moneda, naturaleza) {
 }
 
 /**
- * Persiste el resultado procesado en la tabla comprobantes_final.
+ * Persiste ÚNICAMENTE comprobantes 2x en la tabla comprobantes_final.
  */
 async function guardarEnComprobantesFinal(resultado) {
   try {
-    // Si la tasa viene como 'N/A' o no es un número válido, se asigna 0 directamente.
     const numT1 = (resultado.tasa_1 === 'N/A' || isNaN(resultado.tasa_1)) ? 0 : Number(resultado.tasa_1);
     const numT2 = (resultado.tasa_2 === 'N/A' || isNaN(resultado.tasa_2)) ? 0 : Number(resultado.tasa_2);
 
@@ -401,6 +400,26 @@ async function guardarEnComprobantesFinal(resultado) {
  * 🟢 FUNCIÓN PRINCIPAL EXPORTADA
  */
 async function procesarComprobante(item) {
+  // 🛑 1. COMPUERTA CONTABLE ESTRICTA (Fail-Fast):
+  // Si la primera API reporta conteo < 2, es una operación incompleta (1x).
+  // Se ignora para no ensuciar comprobantes_final ni gastar recursos en tasas.
+  const conteo = parseInt(item.conteo, 10);
+  if (!isNaN(conteo) && conteo < 2) {
+    return null;
+  }
+
+  // 🛑 2. COMPUERTA DE GRUPOS/SOCIOS:
+  // Se requiere la presencia de los dos lados para partida doble contable.
+  const rawGrupo1 = item.id_grupo_1 || item.grupo_raw_1 || item.nombre_socio_1 || item.socio_1 || item.grupo_1 || item.id_chat;
+  const rawGrupo2 = item.id_grupo_2 || item.grupo_raw_2 || item.nombre_socio_2 || item.socio_2 || item.grupo_2;
+
+  const g1Valido = rawGrupo1 && rawGrupo1 !== 'GENERAL' && rawGrupo1 !== 'NO DEFINIDO';
+  const g2Valido = rawGrupo2 && rawGrupo2 !== 'GENERAL' && rawGrupo2 !== 'NO DEFINIDO';
+
+  if (!g1Valido || !g2Valido) {
+    return null;
+  }
+
   const hashLargo = String(
     item.hash_largo || 
     item.id || 
@@ -416,9 +435,6 @@ async function procesarComprobante(item) {
 
   const rawTs = item.timestamp_msg || item.created_at || item.fecha_hora_comprobante || item.fecha;
   const fechaObj = procesarFechaContable(rawTs);
-
-  const rawGrupo1 = item.id_grupo_1 || item.grupo_raw_1 || item.nombre_socio_1 || item.socio_1 || item.grupo_1 || item.id_chat || 'GENERAL';
-  const rawGrupo2 = item.id_grupo_2 || item.grupo_raw_2 || item.nombre_socio_2 || item.socio_2 || item.grupo_2 || 'GENERAL';
 
   const [perfil1, perfil2, loteGlaukov] = await Promise.all([
     obtenerPerfilGrupo(rawGrupo1),
@@ -472,9 +488,6 @@ async function procesarComprobante(item) {
   const polaridad1 = obtenerPolaridadPorTipo(perfil1, moneda, tipoCalculado, true);
   const polaridad2 = obtenerPolaridadPorTipo(perfil2, moneda, tipoCalculado, false);
 
-  const s2Upper = String(nombreGrupo2).toUpperCase().trim();
-  const esX2 = Boolean(s2Upper && s2Upper !== 'GENERAL' && s2Upper !== 'NO DEFINIDO');
-
   const resultado = {
     id: hashLargo,
     hash_largo: hashLargo,
@@ -496,7 +509,7 @@ async function procesarComprobante(item) {
     link_img: item.url_r2_comprobante || item.link_img || item.url_imagen || '',
     url_r2_comprobante: item.url_r2_comprobante || item.link_img || item.url_imagen || '',
 
-    es_x2: esX2,
+    es_x2: true, // 🟢 Al pasar los filtros anteriores, siempre es una operación 2x completa
     lote: loteCodigo,
     lote_tasa_asignado: loteCodigo,
 
@@ -538,7 +551,7 @@ async function procesarComprobante(item) {
     }
   };
 
-  // Guardar/Actualizar automáticamente en comprobantes_final
+  // 🟢 Persistir únicamente operaciones válidas
   await guardarEnComprobantesFinal(resultado);
 
   return resultado;
